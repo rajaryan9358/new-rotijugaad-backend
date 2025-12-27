@@ -43,4 +43,5 @@ const Admin = sequelize.define('Admin', {
 
 Admin.belongsTo(Role, { foreignKey: 'role_id', as: 'roleRelation' });
 
+// NOTE: Joined from User.status_change_by via User.belongsTo(Admin, { as: 'StatusChangedBy' }).
 module.exports = Admin;

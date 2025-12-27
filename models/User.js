@@ -1,6 +1,8 @@
 const { DataTypes } = require('sequelize');
 const { sequelize } = require('../config/db');
 
+const Admin = require('./Admin'); // NEW: for status_change_by -> admins.id join
+
 const User = sequelize.define('User', {
   id: {
     type: DataTypes.INTEGER,
@@ -35,6 +37,14 @@ const User = sequelize.define('User', {
   is_active: {
     type: DataTypes.BOOLEAN,
     defaultValue: true,
+  },
+  deactivation_reason: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  status_change_by: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
   },
   verified_at: {
     type: DataTypes.DATE,
@@ -71,6 +81,10 @@ const User = sequelize.define('User', {
     type: DataTypes.DATE,
     allowNull: true,
   },
+  profile_completed_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
 
   // referral fields
   referral_code: {
@@ -90,6 +104,14 @@ const User = sequelize.define('User', {
   createdAt: 'created_at',
   updatedAt: 'updated_at',
   deletedAt: 'deleted_at',
+});
+
+// NEW: status_change_by (users) -> Admin.id
+// Used by employers list/detail includes as: User.StatusChangedBy.name
+User.belongsTo(Admin, {
+  foreignKey: 'status_change_by',
+  as: 'StatusChangedBy',
+  constraints: false
 });
 
 module.exports = User;

@@ -5,6 +5,8 @@ const fs = require('fs');
 const multer = require('multer');
 const { sequelize } = require('../config/db');
 const { Op } = require('sequelize');
+const Log = require('../models/Log');
+const getAdminId = require('../utils/getAdminId');
 let Story;
 try {
   Story = require('../models/Story');
@@ -93,6 +95,24 @@ router.use((req, _res, next) => {
 // size limit middlewares (like users.js)
 router.use(express.json({ limit: '10mb' }));
 router.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+const safeCreateLog = async (payload) => {
+  try {
+    await Log.create(payload);
+  } catch (error) {
+    console.error('[logs] failed to create log', error);
+  }
+};
+
+const safeLog = async (req, { category, type, redirect_to, log_text }) => {
+  return safeCreateLog({
+    category,
+    type,
+    redirect_to: redirect_to || null,
+    log_text: log_text || null,
+    rj_employee_id: getAdminId(req),
+  });
+};
 
 /**
  * GET /stories
@@ -258,6 +278,12 @@ router.post('/', async (req, res) => {
       sequence: Number.isFinite(+payload.sequence) ? +payload.sequence : 0,
       is_active: typeof payload.is_active === 'boolean' ? payload.is_active : String(payload.is_active) !== 'false'
     });
+    await safeLog(req, {
+      category: 'stories',
+      type: 'add',
+      redirect_to: '/stories',
+      log_text: `Story created: #${s.id} (${s.title_english || '-'})`,
+    });
     const plain = s.get({ plain: true });
     if (plain.image) plain.image = toFullUrl(req, plain.image);
     if (!plain.created_at && plain.createdAt) plain.created_at = plain.createdAt;
@@ -291,6 +317,13 @@ router.put('/:id', async (req, res) => {
       is_active: payload.is_active !== undefined ? (typeof payload.is_active === 'boolean' ? payload.is_active : String(payload.is_active) !== 'false') : s.is_active
     });
 
+    await safeLog(req, {
+      category: 'stories',
+      type: 'update',
+      redirect_to: '/stories',
+      log_text: `Story updated: #${s.id} (${(req.body?.title_english ?? s.title_english) || '-'})`,
+    });
+
     const plain = s.get({ plain: true });
     if (plain.image) plain.image = toFullUrl(req, plain.image);
     if (!plain.created_at && plain.createdAt) plain.created_at = plain.createdAt;
@@ -311,6 +344,14 @@ router.delete('/:id', async (req, res) => {
     const s = await Story.findByPk(req.params.id);
     if (!s) return res.status(404).json({ success: false, message: 'Story not found' });
     await s.destroy();
+
+    await safeLog(req, {
+      category: 'stories',
+      type: 'delete',
+      redirect_to: '/stories',
+      log_text: `Story deleted: #${s.id} (${s.title_english || '-'})`,
+    });
+
     res.json({ success: true, message: 'Story deleted successfully' });
   } catch (e) {
     console.error('[stories] delete error:', e);

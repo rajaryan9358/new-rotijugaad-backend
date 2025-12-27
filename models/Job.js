@@ -32,6 +32,12 @@ const Job = sequelize.define('Job', {
     defaultValue: 1,
   },
 
+  hired_total: {
+    type: DataTypes.INTEGER,
+    allowNull: false,
+    defaultValue: 0,
+  },
+
   interviewer_contact: {
     type: DataTypes.STRING,
     allowNull: true,
@@ -81,17 +87,18 @@ const Job = sequelize.define('Job', {
   },
 
   status: {
-    type: DataTypes.ENUM('active', 'inactive'),
+    type: DataTypes.ENUM('active', 'inactive', 'expired'),
     allowNull: false,
     defaultValue: 'active',
   },
 
-  hired_total: {
-    type: DataTypes.INTEGER,
+  verification_status: {
+    type: DataTypes.ENUM('pending', 'approved', 'rejected'),
     allowNull: false,
-    defaultValue: 0,
+    defaultValue: 'pending',
   },
 
+  // NOTE: expired_at is the authoritative "expired" marker for filtering/UI.
   expired_at: {
     type: DataTypes.DATE,
     allowNull: true,
@@ -105,6 +112,11 @@ const Job = sequelize.define('Job', {
   updatedAt: 'updated_at',
   deletedAt: 'deleted_at',
 });
+
+// MIGRATION (run once in DB; MySQL example):
+// ALTER TABLE `jobs`
+//   ADD COLUMN `verification_status` ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending'
+//   AFTER `status`;
 
 const State = require('./State');
 const City = require('./City');
@@ -121,5 +133,10 @@ if (!Job.associations.JobCity) {
     as: 'JobCity'
   });
 }
+
+// NOTE: Do not add Job.belongsTo(Employer, { as: 'Employer' }) here;
+// an association with alias "Employer" is already defined elsewhere and will crash Sequelize.
+
+// (no changes needed; status enum already includes 'expired')
 
 module.exports = Job;

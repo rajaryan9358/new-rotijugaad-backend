@@ -50,11 +50,16 @@ const Employer = sequelize.define('Employer', {
     allowNull: false,
     defaultValue: 'pending',
   },
+
+  verification_at: { type: DataTypes.DATE, allowNull: true }, // NEW: when verification_status is set to verified/rejected
+
   kyc_status: {
     type: DataTypes.ENUM('pending', 'verified', 'rejected'),
     allowNull: false,
     defaultValue: 'pending',
   },
+
+  kyc_verification_at: { type: DataTypes.DATE, allowNull: true }, // NEW: timestamp used by admin-web filters + dashboard recent additions
 
   total_contact_credit: {
     type: DataTypes.INTEGER,
@@ -96,6 +101,7 @@ const Employer = sequelize.define('Employer', {
     allowNull: true,
     references: { model: 'employer_subscription_plans', key: 'id' },
   },
+
 }, {
   tableName: 'employers',
   timestamps: true,
@@ -104,6 +110,8 @@ const Employer = sequelize.define('Employer', {
   updatedAt: 'updated_at',
   deletedAt: 'deleted_at',
 });
+
+// NOTE: No changes required for status_change_by (tracked on users.status_change_by -> User.StatusChangedBy -> Admin.name).
 
 if (!Employer.associations.BusinessCategory) {
   Employer.belongsTo(BusinessCategory, {

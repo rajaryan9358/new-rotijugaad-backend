@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { Op } = require('sequelize');
 const { sequelize } = require('../config/db');
+const jwt = require('jsonwebtoken');
 
 // dynamic model loading with fallbacks (handles missing exports)
 const models = require('../models');
@@ -11,6 +12,114 @@ const Employer = models.Employer || require('../models/Employer');
 const EmployeeSubscriptionPlan = models.EmployeeSubscriptionPlan || require('../models/EmployeeSubscriptionPlan');
 const EmployerSubscriptionPlan = models.EmployerSubscriptionPlan || require('../models/EmployerSubscriptionPlan');
 const User = models.User || require('../models/User');
+
+const Log = models.Log || require('../models/Log');
+const getAdminId = require('../utils/getAdminId');
+
+const { generateInvoiceHtml } = require('../utils/invoice');
+
+const { authenticate } = require('../middleware/auth');
+
+// Require either a valid signed invoice token (?t=...) or a normal Authorization header.
+const authenticateOrInvoiceToken = (req, res, next) => {
+  const t = (req.query?.t || '').toString().trim();
+  if (t) return next();
+  return authenticate(req, res, next);
+};
+
+const safeCreateLog = async (payload) => {
+  try {
+    if (!Log) return;
+    await Log.create(payload);
+  } catch (e) {
+    // never break main flows for logging
+  }
+};
+
+const sendInvoicePdfForRow = async (row, res) => {
+  let plan = null;
+  if (row.user_type === 'employee' && EmployeeSubscriptionPlan) {
+    plan = await EmployeeSubscriptionPlan.findByPk(row.plan_id, { paranoid: true });
+  } else if (row.user_type === 'employer' && EmployerSubscriptionPlan) {
+    plan = await EmployerSubscriptionPlan.findByPk(row.plan_id, { paranoid: true });
+  }
+
+  let entity = null;
+  if (row.user_type === 'employee' && Employee) {
+    entity = await Employee.findByPk(row.user_id, { paranoid: true });
+  } else if (row.user_type === 'employer' && Employer) {
+    entity = await Employer.findByPk(row.user_id, { paranoid: true });
+  }
+
+  const invoiceNumber = row.invoice_number || `INV-${row.id}`;
+  const invDate = row.created_at || new Date();
+
+  const planName = plan?.plan_name_english || plan?.plan_name_hindi || (row.plan_id ? `Plan #${row.plan_id}` : 'Subscription');
+  const subsStart = row.created_at || new Date();
+  const subsEnd = row.expiry_at || row.created_at || new Date();
+
+  const listPrice = Number(plan?.plan_price ?? row.price_total ?? 0);
+  const invoiceTotal = Number(row.price_total ?? 0);
+  const discount = Math.max(0, Number((listPrice - invoiceTotal).toFixed(2)));
+
+  const organization = row.user_type === 'employer'
+    ? (entity?.organization_name || '—')
+    : '—';
+
+  const name = entity?.name || '—';
+
+  const address = row.user_type === 'employer'
+    ? (entity?.address || '—')
+    : '—';
+
+  const invoiceData = {
+    Order_ID: row.order_id || '',
+    inv_date: invDate,
+    inv_number: invoiceNumber,
+    user_name: '',
+    name,
+    address,
+    subscription_name: planName,
+    subscription_start: subsStart,
+    subscription_end: subsEnd,
+    list_price: listPrice.toFixed(2),
+    discount: discount.toFixed(2),
+    amount: invoiceTotal.toFixed(2),
+    invoice_total: invoiceTotal.toFixed(2),
+    organization,
+  };
+
+  const html = generateInvoiceHtml(invoiceData);
+
+  let puppeteer;
+  try {
+    puppeteer = require('puppeteer');
+  } catch (e) {
+    return res.status(500).json({
+      success: false,
+      message: "Invoice PDF generator not installed. Run: (cd backend && npm i puppeteer)"
+    });
+  }
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+
+    const pdfOut = await page.pdf({ format: 'A4', printBackground: true });
+    const pdfBuffer = Buffer.isBuffer(pdfOut) ? pdfOut : Buffer.from(pdfOut);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="invoice-${String(invoiceNumber).replace(/[^a-zA-Z0-9_-]/g, '_')}.pdf"`);
+    return res.status(200).send(pdfBuffer);
+  } finally {
+    await browser.close();
+  }
+};
 
 // helper: detect migration issues
 const isMigrationMissing = (msg = '') =>
@@ -30,10 +139,12 @@ router.get('/', async (req, res) => {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limitParam = parseInt(req.query.limit, 10);
     const limit = Math.min(Math.max(limitParam || 25, 1), 100);
-    const sortableFields = new Set(['id', 'created_at', 'price_total', 'expiry_at', 'status']);
+    const sortableFields = new Set(['id', 'created_at', 'price_total', 'expiry_at', 'status', 'invoice_number']);
     const sortField = sortableFields.has(req.query.sortField) ? req.query.sortField : 'id';
     const sortDir = (req.query.sortDir || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
-    const { user_type, plan_id, status, user_id, expiry_status } = req.query;
+    const { user_type, plan_id, status, user_id, expiry_status, created_from, created_to } = req.query;
+    const createdDateStart = req.query.created_date_start; // NEW alias
+    const createdDateEnd = req.query.created_date_end;     // NEW alias
 
     const where = {};
     if (user_type) where.user_type = user_type;
@@ -46,12 +157,45 @@ router.get('/', async (req, res) => {
     if (expiry_status === 'active') where.expiry_at = { [Op.gte]: new Date() };
     if (expiry_status === 'expired') where.expiry_at = { [Op.lt]: new Date() };
 
+    // NEW: created date range filter (inclusive)
+    const parseLocalDateTime = (dateStr, timeStr) => {
+      if (!dateStr) return null;
+      const d = new Date(`${dateStr}T${timeStr}`); // local time
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+    const createdFrom = parseLocalDateTime(
+      String((created_from || createdDateStart || '')).trim(),
+      '00:00:00.000'
+    );
+    const createdTo = parseLocalDateTime(
+      String((created_to || createdDateEnd || '')).trim(),
+      '23:59:59.999'
+    );
+    if (createdFrom || createdTo) {
+      where.created_at = {
+        ...(createdFrom ? { [Op.gte]: createdFrom } : {}),
+        ...(createdTo ? { [Op.lte]: createdTo } : {})
+      };
+    }
+
     const searchRaw = (req.query.search || '').trim();
     if (searchRaw) {
       const like = { [Op.like]: `%${searchRaw}%` };
-      const clauses = [{ order_id: like }, { payment_id: like }];
+      const clauses = [{ order_id: like }, { payment_id: like }, { invoice_number: like }];
+
+      // exact numeric id match (keep)
       const numeric = Number(searchRaw);
       if (!Number.isNaN(numeric)) clauses.push({ id: numeric });
+
+      // fallback: id partial/string match (helps when numeric match isn't hitting as expected)
+      const dialect = typeof sequelize.getDialect === 'function' ? sequelize.getDialect() : '';
+      const idCastType = dialect === 'postgres' ? 'text' : 'char';
+      clauses.push(
+        sequelize.where(
+          sequelize.cast(sequelize.col('id'), idCastType),
+          { [Op.like]: `%${searchRaw}%` }
+        )
+      );
 
       const lowered = `%${searchRaw.toLowerCase()}%`;
       const [employeeMatches, employerMatches] = await Promise.all([
@@ -197,43 +341,51 @@ router.get('/', async (req, res) => {
  * GET /api/payment-history/:id
  * Retrieve detailed payment history entry information.
  */
+
+/**
+ * GET /api/payment-history/invoice/:invoiceNumber
+ * Returns a PDF invoice for a given invoice number (auth required).
+ */
+router.get('/invoice/:invoiceNumber', authenticate, async (req, res) => {
+  try {
+    if (!PaymentHistory) {
+      return res.status(500).json({ success: false, message: 'PaymentHistory model not loaded' });
+    }
+
+    const raw = String(req.params.invoiceNumber || '').trim();
+    if (!raw) return res.status(400).json({ success: false, message: 'Invalid invoice number' });
+
+    let row = null;
+    const invMatch = raw.match(/^INV-(\d+)$/i);
+    if (invMatch) {
+      row = await PaymentHistory.findByPk(invMatch[1], { paranoid: true });
+    }
+
+    if (!row) {
+      row = await PaymentHistory.findOne({ where: { invoice_number: raw }, paranoid: true });
+    }
+
+    if (!row) return res.status(404).json({ success: false, message: 'Not found' });
+
+    return await sendInvoicePdfForRow(row, res);
+  } catch (e) {
+    console.error('[payment-history] invoice-by-number error:', e);
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     if (!PaymentHistory) {
       return res.status(500).json({ success:false, message:'PaymentHistory model not loaded' });
     }
-    const row = await PaymentHistory.findByPk(req.params.id, { paranoid:true });
-    if (!row) return res.status(404).json({ success:false, message:'Not found' });
+    const row = await PaymentHistory.findByPk(req.params.id, { paranoid: true });
+    if (!row) return res.status(404).json({ success: false, message: 'Not found' });
 
-    let plan = null;
-    if (row.user_type === 'employee' && EmployeeSubscriptionPlan) {
-      plan = await EmployeeSubscriptionPlan.findByPk(row.plan_id);
-    } else if (row.user_type === 'employer' && EmployerSubscriptionPlan) {
-      plan = await EmployerSubscriptionPlan.findByPk(row.plan_id);
-    }
-
-    let entity = null;
-    if (row.user_type === 'employee' && Employee) {
-      entity = await Employee.findByPk(row.user_id, { paranoid: true });
-    } else if (row.user_type === 'employer' && Employer) {
-      entity = await Employer.findByPk(row.user_id, { paranoid: true });
-    }
-
-    const user = entity?.user_id && User
-      ? await User.findByPk(entity.user_id, { paranoid: true })
-      : null;
-
-    row.setDataValue('plan', plan);
-    row.setDataValue('entity', entity);
-    row.setDataValue('user', user);
-
-    res.json({ success:true, data: row });
+    return await sendInvoicePdfForRow(row, res);
   } catch (e) {
-    console.error('[payment-history] detail error:', e);
-    if (isMigrationMissing(e.message)) {
-      return res.status(500).json({ success:false, message:'Pending migration: payment_histories table missing' });
-    }
-    res.status(500).json({ success:false, message:e.message });
+    console.error('[payment-history] invoice error:', e);
+    return res.status(500).json({ success: false, message: e.message });
   }
 });
 
@@ -249,6 +401,16 @@ router.delete('/:id', async (req, res) => {
     const row = await PaymentHistory.findByPk(req.params.id);
     if (!row) return res.status(404).json({ success:false, message:'Not found' });
     await row.destroy();
+
+    const adminId = getAdminId(req);
+    await safeCreateLog({
+      category: 'payment history',
+      type: 'delete',
+      redirect_to: '/payment-history',
+      log_text: `Deleted payment history: #${row.id} ${row.user_type}#${row.user_id} plan_id=${row.plan_id || '-'} price_total=${row.price_total || '-'} status=${row.status || '-'} invoice=${row.invoice_number || '-'}`,
+      rj_employee_id: adminId,
+    });
+
     res.json({ success:true, message:'Deleted' });
   } catch (e) {
     console.error('[payment-history] delete error:', e);

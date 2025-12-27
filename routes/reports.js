@@ -3,6 +3,19 @@ const router = express.Router();
 const { Op } = require('sequelize');
 const { sequelize } = require('../config/db');
 const models = require('../models');
+const { authenticate } = require('../middleware/auth');
+const Log = require('../models/Log');
+const getAdminId = require('../utils/getAdminId');
+
+const safeCreateLog = async (payload) => {
+  try {
+    if (!Log) return;
+    await Log.create(payload);
+  } catch (e) {
+    // never break main flows for logging
+  }
+};
+
 
 const loadModel = (key, path) => {
   if (models[key]) return models[key];
@@ -13,6 +26,7 @@ const loadModel = (key, path) => {
 const Report = loadModel('Report', '../models/Report');
 const Employee = loadModel('Employee', '../models/Employee');
 const Employer = loadModel('Employer', '../models/Employer');
+const User = loadModel('User', '../models/User');
 const Job = loadModel('Job', '../models/Job');
 const JobProfile = loadModel('JobProfile', '../models/JobProfile');
 const EmployeeReportReason = loadModel('EmployeeReportReason', '../models/EmployeeReportReason');
@@ -55,6 +69,7 @@ router.get('/', async (req, res) => {
       const reportId = parseInt(req.query.report_id, 10);
       if (!Number.isNaN(reportId)) where.report_id = reportId;
     }
+
 
     const readStatus = (req.query.read_status || '').toLowerCase();
     if (readStatus === 'read') where.read_at = { [Op.ne]: null };
@@ -259,7 +274,11 @@ router.get('/', async (req, res) => {
       employerReasons
     ] = await Promise.all([
       Employee && employeeIds.size ? Employee.findAll({ where: { id: [...employeeIds] }, paranoid: true }) : [],
-      Employer && employerIds.size ? Employer.findAll({ where: { id: [...employerIds] }, paranoid: true }) : [],
+      Employer && employerIds.size ? Employer.findAll({
+        where: { id: [...employerIds] },
+        include: User ? [{ model: User, as: 'User', attributes: ['id', 'is_active'], paranoid: false }] : [],
+        paranoid: true
+      }) : [],
       Job && jobIds.size ? Job.findAll({ where: { id: [...jobIds] }, paranoid: true }) : [],
       EmployeeReportReason && employeeReasonIds.size ? EmployeeReportReason.findAll({ where: { id: [...employeeReasonIds] }, paranoid: true }) : [],
       EmployerReportReason && employerReasonIds.size ? EmployerReportReason.findAll({ where: { id: [...employerReasonIds] }, paranoid: true }) : []
@@ -349,7 +368,66 @@ const markReadHandler = async (req, res) => {
     if (!Report) return res.status(500).json({ success: false, message: 'Report model unavailable' });
     const row = await Report.findByPk(req.params.id, { paranoid: true });
     if (!row) return res.status(404).json({ success: false, message: 'Report not found' });
-    if (!row.read_at) await row.update({ read_at: new Date() });
+    let didMarkRead = false;
+    if (!row.read_at) {
+      await row.update({ read_at: new Date() });
+      didMarkRead = true;
+    }
+
+    if (didMarkRead) {
+      const adminId = getAdminId(req);
+      const reportType = (row.report_type || '').toString().toLowerCase();
+      const redirectTo = reportType === 'employee'
+        ? `/employees/${row.report_id}`
+        : reportType === 'job'
+          ? `/jobs/${row.report_id}`
+          : null;
+
+      await safeCreateLog({
+        category: 'voilation reports',
+        type: 'update',
+        redirect_to: redirectTo,
+        log_text: `Report marked read: #${row.id} report_type=${row.report_type} report_id=${row.report_id}`,
+        rj_employee_id: adminId,
+      });
+
+      if (reportType === 'employee') {
+        await safeCreateLog({
+          category: 'employee',
+          type: 'update',
+          redirect_to: redirectTo,
+          log_text: `Employee violation report marked read: employee #${row.report_id} report #${row.id}`,
+          rj_employee_id: adminId,
+        });
+      }
+
+      if (reportType === 'job') {
+        await safeCreateLog({
+          category: 'jobs',
+          type: 'update',
+          redirect_to: redirectTo,
+          log_text: `Job violation report marked read: job #${row.report_id} report #${row.id}`,
+          rj_employee_id: adminId,
+        });
+
+        try {
+          const job = Job ? await Job.findByPk(row.report_id, { paranoid: false }) : null;
+          const employerId = job?.employer_id;
+          if (employerId) {
+            await safeCreateLog({
+              category: 'employer',
+              type: 'update',
+              redirect_to: `/employers/${employerId}`,
+              log_text: `Employer violation report marked read: employer #${employerId} report #${row.id} job #${row.report_id}`,
+              rj_employee_id: adminId,
+            });
+          }
+        } catch {
+          // ignore join failures
+        }
+      }
+    }
+
     res.json({ success: true, data: row });
   } catch (error) {
     console.error('[reports] read error:', error);
@@ -361,9 +439,9 @@ const markReadHandler = async (req, res) => {
  * PATCH /api/reports/:id/mark-read
  * Mark a report as read.
  */
-router.patch('/:id/mark-read', markReadHandler);
+router.patch('/:id/mark-read', authenticate, markReadHandler);
 // allow PUT for clients using PUT
-router.put('/:id/mark-read', markReadHandler);
+router.put('/:id/mark-read', authenticate, markReadHandler);
 
 /**
  * DELETE /api/reports/:id
@@ -375,6 +453,16 @@ router.delete('/:id', async (req, res) => {
     const row = await Report.findByPk(req.params.id, { paranoid: true });
     if (!row) return res.status(404).json({ success: false, message: 'Report not found' });
     await row.destroy();
+
+    const adminId = getAdminId(req);
+    await safeCreateLog({
+      category: 'voilation reports',
+      type: 'delete',
+      redirect_to: '/violation-reports',
+      log_text: `Deleted report: #${row.id} report_type=${row.report_type} report_id=${row.report_id} user_id=${row.user_id}`,
+      rj_employee_id: adminId,
+    });
+
     res.json({ success: true, message: 'Report deleted' });
   } catch (error) {
     console.error('[reports] delete error:', error);

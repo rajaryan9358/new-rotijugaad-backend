@@ -81,6 +81,12 @@ const PaymentHistory = sequelize.define('PaymentHistory', {
     comment: 'Expiry date for the payment/plan',
   },
 
+  invoice_number: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    comment: 'Invoice number for this payment',
+  },
+
 }, {
   tableName: 'payment_histories',
   timestamps: true,
@@ -89,5 +95,20 @@ const PaymentHistory = sequelize.define('PaymentHistory', {
   updatedAt: 'updated_at',
   deletedAt: 'deleted_at',
 });
+
+/**
+ * DB migration (run once):
+ *
+ * MySQL:
+ *   ALTER TABLE payment_histories
+ *     ADD COLUMN invoice_number VARCHAR(255) NULL AFTER expiry_at;
+ *
+ * Postgres:
+ *   ALTER TABLE payment_histories
+ *     ADD COLUMN invoice_number VARCHAR(255);
+ *
+ * Optional (either DB; adjust syntax if needed):
+ *   CREATE INDEX idx_payment_histories_invoice_number ON payment_histories (invoice_number);
+ */
 
 module.exports = PaymentHistory;

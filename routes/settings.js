@@ -1,6 +1,22 @@
 const express = require('express');
 const router = express.Router();
 const Setting = require('../models/Setting');
+const Log = require('../models/Log');
+const getAdminId = require('../utils/getAdminId');
+
+const safeCreateLog = (req, payload) => {
+  try {
+    return Log.create({
+      category: payload.category,
+      type: payload.type,
+      redirect_to: payload.redirect_to || null,
+      log_text: payload.log_text || null,
+      rj_employee_id: payload?.rj_employee_id ?? getAdminId(req) ?? null,
+    }).catch(() => null);
+  } catch (_) {
+    return Promise.resolve(null);
+  }
+};
 
 const allowedFields = [
   'employee_support_mobile',
@@ -28,6 +44,8 @@ const allowedFields = [
 router.get('/', async (req, res) => {
   try {
     const setting = await Setting.findOne({ order: [['id', 'ASC']] });
+
+
     res.json({ success: true, data: setting });
   } catch (error) {
     console.error('[settings:get] error', error);
@@ -51,6 +69,22 @@ router.post('/', async (req, res) => {
     } else {
       setting = await Setting.create(payload);
     }
+
+    try {
+      const before = existing ? existing.toJSON() : null;
+      const changedFields = Object.keys(payload).filter((key) => {
+        if (!before) return true;
+        return String(before[key] ?? '') !== String(payload[key] ?? '');
+      });
+      const changedText = changedFields.length ? changedFields.join(', ') : 'no changes';
+      void safeCreateLog(req, {
+        category: 'setting',
+        type: 'update',
+        redirect_to: '/settings',
+        log_text: `Updated settings (id: ${setting?.id || '-'}) fields: ${changedText}`,
+      });
+    } catch (_) {}
+
     res.json({ success: true, data: setting });
   } catch (error) {
     console.error('[settings:upsert] error', error);

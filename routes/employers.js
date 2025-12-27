@@ -9,6 +9,7 @@ const State = require('../models/State');
 const City = require('../models/City');
 const EmployerSubscriptionPlan = require('../models/EmployerSubscriptionPlan');
 const User = require('../models/User');
+const Admin = require('../models/Admin'); // NEW: for User.StatusChangedBy join
 const models = require('../models');
 const Job = models.Job;
 const JobInterest = models.JobInterest;
@@ -18,9 +19,27 @@ const EmployeeJobProfile = models.EmployeeJobProfile;
 const EmployerContact = require('../models/EmployerContact');
 const CallHistory = require('../models/CallHistory');
 const EmployerCallExperience = require('../models/EmployerCallExperience');
-const markUserAsDeleted = require('../utils/markUserAsDeleted');
+const { deleteByEmployerId } = require('../utils/deleteUserTransactional');
 const Referral = require('../models/Referral'); // added
+const getAdminId = require('../utils/getAdminId');
+const Log = require('../models/Log');
 
+const { authenticate } = require('../middleware/auth');
+
+const employerRedirect = (id) => `/employers/${id}`;
+
+const safeLog = async (req, payload) => {
+  try {
+    const adminId = getAdminId(req);
+    if (!adminId) return;
+    await Log.create({
+      ...payload,
+      rj_employee_id: adminId,
+    });
+  } catch (e) {
+    // never break main flows for logging
+  }
+};
 
 // include definitions
 const baseInclude = [
@@ -45,406 +64,430 @@ const ensureUserInclude = (includeList = []) => {
   return userInclude;
 };
 
+
+
+const SORTABLE_FIELDS = new Set([
+  'id',
+  'created_at',
+  'updated_at',
+  'name',
+  'organization_name',
+  'verification_status',
+  'kyc_status'
+]);
+
+const parseBool = (v) => ['true', '1', 'yes'].includes(String(v || '').toLowerCase());
+const parseIntSafe = (v) => {
+  const n = parseInt(v, 10);
+  return Number.isNaN(n) ? null : n;
+};
+
+const buildEmployerAttributes = (body = {}) => ({
+  name: body.name ?? undefined,
+  organization_type: body.organization_type ?? undefined,
+  organization_name: body.organization_name ?? undefined,
+  business_category_id: body.business_category_id ?? undefined,
+  state_id: body.state_id ?? undefined,
+  city_id: body.city_id ?? undefined,
+  address: body.address ?? undefined,
+  email: body.email ?? undefined,
+  aadhar_number: body.aadhar_number ?? undefined,
+  assisted_by: body.assisted_by ?? undefined,
+  document_link: body.document_link ?? undefined
+});
+
+const stripUndefined = (obj) => {
+  const out = {};
+  Object.keys(obj || {}).forEach((k) => {
+    if (obj[k] !== undefined) out[k] = obj[k]; // FIX: was dropping values
+  });
+  return out;
+};
+
+const normalizeDateOrNull = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+const startOfDay = (date) => {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
+const endExclusiveOfDay = (date) => {
+  const d = startOfDay(date);
+  d.setDate(d.getDate() + 1);
+  return d;
+};
+
+
 /**
  * GET /employers
- * List all employers with related entities.
+ * List employers.
  */
 router.get('/', async (req, res) => {
   try {
-    const fetchAll = ['true', '1'].includes(String(req.query.all || '').toLowerCase());
-    const parseIntSafe = (value) => {
-      const parsed = parseInt(value, 10);
-      return Number.isNaN(parsed) ? undefined : parsed;
-    };
-
+    const fetchAll = parseBool(req.query.all);
     const page = Math.max(parseIntSafe(req.query.page) || 1, 1);
-    const rawLimit = parseIntSafe(req.query.limit);
-    const limit = fetchAll ? undefined : Math.min(Math.max(rawLimit || 25, 1), 200);
-    const offset = limit ? (page - 1) * limit : undefined;
 
-    const where = {};
+    const rawLimit = req.query.pageSize ?? req.query.limit;
+    const limitParam = parseIntSafe(rawLimit);
+    const limit = fetchAll ? undefined : Math.min(Math.max(limitParam || 25, 1), 200);
+
+    const sortField = SORTABLE_FIELDS.has(req.query.sortField) ? req.query.sortField : 'id';
+    const sortDir = String(req.query.sortDir || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+
+    const include = baseInclude.map((item) => ({ ...item }));
+    const userInclude = ensureUserInclude(include);
+
+    userInclude.attributes = [
+      'id',
+      'mobile',
+      'is_active',
+      'deactivation_reason',
+      'status_change_by',
+      'preferred_language',
+      'referred_by',
+      'referral_code',
+      'total_referred',
+      'delete_pending',
+      'delete_requested_at',
+      'created_at',
+      'last_active_at',       // NEW: used in EmployersManagement
+      'profile_completed_at'  // NEW: used in EmployersManagement
+    ];
+
+    // NEW: User -> Admin (status_change_by) include
+    userInclude.include = [
+      ...(userInclude.include || []),
+      { model: Admin, as: 'StatusChangedBy', attributes: ['id', 'name'], required: false }
+    ];
+
+    userInclude.required = false;
+
+    const whereClause = {};
     const andConditions = [];
 
-    const stateId = parseIntSafe(req.query.state_id);
-    if (stateId !== undefined) where.state_id = stateId;
+    const parseId = (value) => {
+      if (value === undefined || value === null || value === '') return null;
+      const parsed = parseInt(value, 10);
+      return Number.isNaN(parsed) ? null : parsed;
+    };
 
-    const cityId = parseIntSafe(req.query.city_id);
-    if (cityId !== undefined) where.city_id = cityId;
+    const stateId = parseId(req.query.state_id);
+    if (stateId !== null) whereClause.state_id = stateId;
 
-    const planId = parseIntSafe(req.query.subscription_plan_id);
-    if (planId !== undefined) where.subscription_plan_id = planId;
+    const cityId = parseId(req.query.city_id);
+    if (cityId !== null) whereClause.city_id = cityId;
 
-    const categoryId = parseIntSafe(req.query.category_id);
-    const categoryName = (req.query.category || '').trim();
+    const planId = parseId(req.query.subscription_plan_id);
+    if (planId !== null) whereClause.subscription_plan_id = planId;
 
-    const verificationStatus = (req.query.verification_status || '').trim();
-    if (verificationStatus) where.verification_status = verificationStatus;
+    const organizationType = (req.query.organization_type || '').toString().trim().toLowerCase();
+    if (organizationType) whereClause.organization_type = organizationType;
 
-    const kycStatus = (req.query.kyc_status || '').trim();
-    if (kycStatus) where.kyc_status = kycStatus;
+    const verificationStatus = (req.query.verification_status || '').toString().trim().toLowerCase();
+    if (verificationStatus) whereClause.verification_status = verificationStatus;
 
-    const searchTerm = (req.query.search || '').trim();
-    if (searchTerm) {
-      const lowered = searchTerm.toLowerCase();
-      const pattern = `%${lowered}%`;
+    const kycStatus = (req.query.kyc_status || '').toString().trim().toLowerCase();
+    if (kycStatus) whereClause.kyc_status = kycStatus;
+
+    // NEW: KYC verification date range filter (kyc_verified_from/kyc_verified_to)
+    const kycVerifiedFrom = normalizeDateOrNull(req.query.kyc_verified_from ?? req.query.kycVerifiedFrom);
+    const kycVerifiedTo = normalizeDateOrNull(req.query.kyc_verified_to ?? req.query.kycVerifiedTo);
+    if (kycVerifiedFrom || kycVerifiedTo) {
+      // filtering by verification timestamp implies "verified"
+      whereClause.kyc_status = 'verified';
+
+      const range = {};
+      if (kycVerifiedFrom) range[Op.gte] = startOfDay(kycVerifiedFrom);
+      if (kycVerifiedTo) range[Op.lt] = endExclusiveOfDay(kycVerifiedTo);
+      whereClause.kyc_verification_at = range;
+    }
+
+    const assistedBy = (req.query.assisted_by || '').toString().trim().toLowerCase();
+    if (assistedBy) {
+      const pattern = `%${assistedBy}%`;
+      andConditions.push(Sequelize.where(fn('LOWER', col('Employer.assisted_by')), { [Op.like]: pattern }));
+    }
+
+    const category = (req.query.category || '').toString().trim().toLowerCase();
+    if (category) {
+      const businessCategoryInclude = include.find((inc) => inc.as === 'BusinessCategory');
+      if (businessCategoryInclude) businessCategoryInclude.required = true;
+      andConditions.push(
+        Sequelize.where(fn('LOWER', col('BusinessCategory.category_english')), { [Op.eq]: category })
+      );
+    }
+
+    // created date range filter (createdFrom/createdTo)
+    const createdFrom = normalizeDateOrNull(req.query.createdFrom);
+    const createdTo = normalizeDateOrNull(req.query.createdTo);
+    if (createdFrom || createdTo) {
+      const range = {};
+      if (createdFrom) range[Op.gte] = startOfDay(createdFrom);
+      if (createdTo) range[Op.lt] = endExclusiveOfDay(createdTo);
+      whereClause.created_at = range;
+    }
+
+    const activeStatus = (req.query.active_status || '').toString().trim().toLowerCase();
+    if (activeStatus === 'active' || activeStatus === 'inactive') {
+      userInclude.required = true;
+      andConditions.push(Sequelize.where(col('User.is_active'), { [Op.eq]: activeStatus === 'active' }));
+    }
+
+    const newFilter = (req.query.newFilter || '').toString().trim().toLowerCase();
+    if (newFilter === 'new') {
+      const newSince = new Date(Date.now() - 48 * 60 * 60 * 1000);
+      userInclude.required = true;
+      andConditions.push(Sequelize.where(col('User.created_at'), { [Op.gte]: newSince }));
+    }
+
+    const subscriptionStatus = (req.query.subscription_status || '').toString().trim().toLowerCase();
+    if (subscriptionStatus === 'active') {
+      andConditions.push({
+        [Op.or]: [
+          { credit_expiry_at: null },
+          { credit_expiry_at: { [Op.gt]: new Date() } }
+        ]
+      });
+    } else if (subscriptionStatus === 'expired') {
+      andConditions.push({
+        credit_expiry_at: {
+          [Op.and]: [
+            { [Op.ne]: null },
+            { [Op.lte]: new Date() }
+          ]
+        }
+      });
+    }
+
+    const searchRaw = String(req.query.search || '').trim().toLowerCase();
+    if (searchRaw) {
+      const pattern = `%${searchRaw}%`;
       const searchConditions = [
         Sequelize.where(fn('LOWER', col('Employer.name')), { [Op.like]: pattern }),
         Sequelize.where(fn('LOWER', col('Employer.organization_name')), { [Op.like]: pattern }),
         Sequelize.where(fn('LOWER', col('Employer.email')), { [Op.like]: pattern }),
         Sequelize.where(fn('LOWER', col('State.state_english')), { [Op.like]: pattern }),
-        Sequelize.where(fn('LOWER', col('City.city_english')), { [Op.like]: pattern })
+        Sequelize.where(fn('LOWER', col('City.city_english')), { [Op.like]: pattern }),
+        Sequelize.where(fn('LOWER', col('User.mobile')), { [Op.like]: pattern })
       ];
-      if (/^\d+$/.test(searchTerm)) searchConditions.push({ id: Number(searchTerm) });
+      const numericId = Number(searchRaw);
+      if (!Number.isNaN(numericId)) searchConditions.push({ id: numericId });
       andConditions.push({ [Op.or]: searchConditions });
     }
 
-    const subscriptionStatus = (req.query.subscription_status || '').toLowerCase();
-    const newFilter = (req.query.newFilter || '').toLowerCase();
+    if (andConditions.length) {
+      whereClause[Op.and] = (whereClause[Op.and] || []).concat(andConditions);
+    }
 
-    const include = baseInclude.map((assoc) => ({ ...assoc }));
-    const forceInclude = (alias, condition) => {
-      const idx = include.findIndex((inc) => inc.as === alias);
-      if (idx >= 0) {
-        include[idx] = {
-          ...include[idx],
-          where: { ...(include[idx].where || {}), ...condition },
-          required: true
-        };
-      }
+    const queryOptions = {
+      where: whereClause,
+      include,
+      order: [[sortField, sortDir]],
+      distinct: true,
+      paranoid: true
     };
-
-    if (newFilter === 'new') {
-      const newSince = new Date(Date.now() - 48 * 60 * 60 * 1000);
-      andConditions.push(Sequelize.where(col('User.created_at'), { [Op.gte]: newSince }));
-      const userInclude = ensureUserInclude(include);
-      userInclude.required = true;
-    }
-
-    if (subscriptionStatus === 'active' || subscriptionStatus === 'expired') {
-      const expiryExpr = literal('Employer.credit_expiry_at');
-      if (subscriptionStatus === 'active') {
-        andConditions.push({
-          [Op.or]: [
-            Sequelize.where(expiryExpr, { [Op.is]: null }),
-            Sequelize.where(expiryExpr, { [Op.gt]: new Date() })
-          ]
-        });
-      } else {
-        andConditions.push({
-          [Op.and]: [
-            Sequelize.where(expiryExpr, { [Op.not]: null }),
-            Sequelize.where(expiryExpr, { [Op.lte]: new Date() })
-          ]
-        });
-      }
-    }
-
-    if (andConditions.length) where[Op.and] = andConditions;
-
-    if (categoryId !== undefined) forceInclude('BusinessCategory', { id: categoryId });
-    else if (categoryName) forceInclude('BusinessCategory', { category_english: categoryName });
-
-    const activeStatus = (req.query.active_status || '').toLowerCase();
-    if (activeStatus === 'active' || activeStatus === 'inactive') {
-      const userInclude = ensureUserInclude(include);
-      userInclude.where = { ...(userInclude.where || {}), is_active: activeStatus === 'active' };
-      userInclude.required = true;
-    }
-
-    const sortable = new Set(['id','name','organization_type','organization_name','email','address','verification_status','kyc_status','created_at']);
-    const requestedSortField = (req.query.sortField || '').trim();
-    const requestedSortDir = (req.query.sortDir || '').toLowerCase();
-    const sortDir = requestedSortDir === 'desc' ? 'DESC' : 'ASC';
-    const sortField = ['businessCategoryName', 'is_active'].includes(requestedSortField)
-      ? requestedSortField
-      : (sortable.has(requestedSortField) ? requestedSortField : 'id');
-
-    let order;
-    if (sortField === 'businessCategoryName') {
-      order = [[literal('BusinessCategory.category_english'), sortDir]];
-    } else if (sortField === 'is_active') {
-      order = [[literal('User.is_active'), sortDir]];
-    } else {
-      order = [[sortField, sortDir]];
-    }
-
-    const queryOptions = { where, include, order, distinct: true };
-    if (limit) {
+    if (!fetchAll) {
       queryOptions.limit = limit;
-      queryOptions.offset = offset;
-      queryOptions.subQuery = false;
+      queryOptions.offset = (page - 1) * limit;
     }
 
     const { rows, count } = await Employer.findAndCountAll(queryOptions);
-    const total = typeof count === 'number' ? count : count.length;
-    const totalPages = limit ? Math.max(Math.ceil(total / limit), 1) : 1;
 
     res.json({
       success: true,
       data: rows,
       meta: {
-        page: limit ? page : 1,
-        limit: limit || rows.length,
-        total,
-        totalPages
+        page: fetchAll ? 1 : page,
+        limit: fetchAll ? rows.length : limit,
+        total: count,
+        totalPages: fetchAll ? 1 : Math.max(Math.ceil((count || 1) / (limit || count || 1)), 1)
       }
     });
   } catch (err) {
     console.error('[employers] list error:', err);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({ success: false, message: err.message || 'Failed to load employers' });
   }
 });
 
 /**
  * GET /employers/:id
- * Retrieve employer details by ID.
+ * Get employer by id.
  */
 router.get('/:id', async (req, res) => {
   try {
-    const row = await Employer.findByPk(req.params.id, {
-      include: baseInclude,
-      paranoid: true,
-    });
-    if (!row)
-      return res.status(404).json({ success: false, message: 'Employer not found' });
-    res.json({ success: true, data: row });
-  } catch (e) {
-    console.error('[employers] detail error:', e);
-    res.status(500).json({ success: false, message: e.message });
+    const employerId = parseInt(req.params.id, 10);
+    if (!employerId) return res.status(400).json({ success: false, message: 'Invalid employer id' });
+
+    const include = [...baseInclude];
+    const userInclude = ensureUserInclude(include);
+
+    // NEW: include admin name for status_change_by
+    userInclude.include = [
+      ...(userInclude.include || []),
+      { model: Admin, as: 'StatusChangedBy', attributes: ['id', 'name'], required: false }
+    ];
+
+    const employer = await Employer.findByPk(employerId, { include, paranoid: true });
+    if (!employer) return res.status(404).json({ success: false, message: 'Employer not found' });
+
+    res.json({ success: true, data: employer });
+  } catch (err) {
+    console.error('[employers] getById error:', err);
+    res.status(500).json({ success: false, message: err.message || 'Failed to load employer' });
   }
 });
 
 /**
  * POST /employers
- * Create a new employer (and user if needed).
+ * Create employer (creates/links User via mobile if needed).
  */
-router.post('/', async (req, res) => {
-  const fail = (message, status = 400) => {
-    const err = new Error(message);
-    err.status = status;
-    throw err;
-  };
-
+router.post('/', authenticate, async (req, res) => {
   try {
-    const rawUserId = req.body?.user_id;
-    const mobileInput = (req.body?.mobile || '').trim();
-    const nameInput = (req.body?.name || '').trim();
-    const wantsNewUser = !rawUserId || Number(rawUserId) <= 0;
+    const body = req.body || {};
+    const mobile = String(body.mobile || '').trim();
+    const name = String(body.name || '').trim();
 
-    if (!nameInput) fail('name is required');
-    let finalUser;
+    if (!name) return res.status(400).json({ success: false, message: 'name is required' });
 
-    try {
-      if (!wantsNewUser) {
-        const targetUserId = Number(rawUserId);
-        if (!targetUserId) fail('Invalid user_id', 400);
-        finalUser = await User.findByPk(targetUserId, { paranoid: false });
-        if (!finalUser) fail('Provided user_id not found', 400);
-        if (finalUser.deleted_at) await finalUser.restore();
+    let userId = body.user_id ? parseIntSafe(body.user_id) : null;
+    let user = null;
+
+    if (userId) {
+      user = await User.findByPk(userId, { paranoid: false });
+      if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+      if (mobile && user.mobile !== mobile) await user.update({ mobile });
+      if (!user.user_type) await user.update({ user_type: 'employer' });
+    } else {
+      if (!mobile) return res.status(400).json({ success: false, message: 'mobile is required when user is not pre-selected' });
+      user = await User.findOne({ where: { mobile }, paranoid: false });
+      if (!user) {
+        user = await User.create({ mobile, name: name || null, user_type: 'employer' });
       } else {
-        if (!mobileInput) fail('mobile is required when user is not pre-selected');
-        finalUser = await User.findOne({ where: { mobile: mobileInput }, paranoid: false });
-        if (finalUser) {
-          if (finalUser.deleted_at) await finalUser.restore();
-        } else {
-          finalUser = await User.create({
-            mobile: mobileInput,
-            name: nameInput,
-            user_type: 'employer',
-            is_active: true
-          });
-        }
+        if (!user.user_type) await user.update({ user_type: 'employer' });
       }
-    } catch (userError) {
-      console.error('[employers] user resolve/create error:', userError);
-      return res.status(userError.status || 500).json({
-        success: false,
-        message: userError.message || 'Failed to resolve user'
-      });
+      userId = user.id;
     }
 
-    if ((finalUser.user_type || '').toLowerCase() !== 'employer') {
-      await finalUser.update({ user_type: 'employer' });
-    }
+    const attrs = stripUndefined(buildEmployerAttributes(body));
+    attrs.user_id = userId;
+    attrs.name = name;
 
-    const existingEmployer = await Employer.findOne({
-      where: { user_id: finalUser.id },
-      paranoid: false
+    const employer = await Employer.create(attrs);
+
+    const include = [...baseInclude];
+    ensureUserInclude(include);
+    const created = await Employer.findByPk(employer.id, { include, paranoid: true });
+
+    await safeLog(req, {
+      category: 'employer',
+      type: 'add',
+      redirect_to: employerRedirect(created?.id || employer.id),
+      log_text: `Employer created: #${created?.id || employer.id} ${created?.name || name || '-'}`,
     });
-    if (existingEmployer) {
-      if (existingEmployer.deleted_at) {
-        await existingEmployer.restore();
-        return res.status(409).json({
-          success: false,
-          message: 'Employer already existed and was restored. Please retry.'
-        });
-      }
-      return res.status(409).json({
-        success: false,
-        message: 'An employer for this user already exists.'
-      });
-    }
 
-    const existingEmployee = await Employee.findOne({
-      where: { user_id: finalUser.id },
-      paranoid: false
-    });
-    if (existingEmployee && !existingEmployee.deleted_at) {
-      return res.status(409).json({
-        success: false,
-        message: 'An employee profile already exists for this user.'
-      });
-    }
-
-    if (nameInput && finalUser.name !== nameInput) {
-      await finalUser.update({ name: nameInput });
-    }
-
-    const payload = { ...req.body, name: nameInput };
-    delete payload.mobile;
-    delete payload.user_id;
-
-    const emp = await Employer.create({ ...payload, user_id: finalUser.id });
-
-    res.status(201).json({ success: true, data: emp });
-  } catch (e) {
-    console.error('[employers] create error:', e);
-    const status = e.status || (/unique/i.test(e.message) ? 409 : 500);
-    res.status(status).json({ success: false, message: e.message });
+    res.status(201).json({ success: true, data: created });
+  } catch (err) {
+    console.error('[employers] create error:', err);
+    res.status(500).json({ success: false, message: err.message || 'Failed to create employer' });
   }
 });
 
 /**
  * PUT /employers/:id
- * Update employer and linked user information.
+ * Update employer (also updates linked User.mobile if provided).
  */
-router.put('/:id', async (req, res) => {
+router.put('/:id', authenticate, async (req, res) => {
   try {
-    const emp = await Employer.findByPk(req.params.id);
-    if (!emp) return res.status(404).json({ success: false, message: 'Employer not found' });
+    const employerId = parseInt(req.params.id, 10);
+    if (!employerId) return res.status(400).json({ success: false, message: 'Invalid employer id' });
 
-    const user = await User.findByPk(emp.user_id, { paranoid: false });
-    if (!user) return res.status(404).json({ success: false, message: 'Linked user not found' });
-    if (user.deleted_at) await user.restore();
+    const employer = await Employer.findByPk(employerId, { paranoid: false });
+    if (!employer) return res.status(404).json({ success: false, message: 'Employer not found' });
 
-    const payload = { ...req.body };
-    const nameInput = typeof payload.name === 'string' ? payload.name.trim() : undefined;
-    if (nameInput !== undefined) {
-      if (!nameInput) return res.status(400).json({ success: false, message: 'name cannot be empty' });
-      payload.name = nameInput;
-    } else {
-      delete payload.name;
+    const body = req.body || {};
+    const mobile = String(body.mobile || '').trim();
+    if (mobile) {
+      const user = await User.findByPk(employer.user_id, { paranoid: false });
+      if (user) await user.update({ mobile });
     }
 
-    const mobileInput = typeof req.body.mobile === 'string' ? req.body.mobile.trim() : undefined;
-    const userUpdates = {};
-    if (nameInput && nameInput !== user.name) userUpdates.name = nameInput;
+    const attrs = stripUndefined(buildEmployerAttributes(body));
+    // name is required for Employer model; accept updates
+    if (body.name !== undefined) attrs.name = String(body.name || '').trim();
 
-    if (mobileInput !== undefined && mobileInput !== user.mobile) {
-      if (!mobileInput) return res.status(400).json({ success: false, message: 'mobile cannot be empty' });
-      const duplicateUser = await User.findOne({
-        where: { mobile: mobileInput },
-        paranoid: false
-      });
-      if (duplicateUser && duplicateUser.id !== user.id) {
-        return res.status(409).json({ success: false, message: 'Mobile already exists' });
-      }
-      userUpdates.mobile = mobileInput;
-    }
+    await employer.update(attrs);
 
-    delete payload.mobile;
-    delete payload.user_id;
+    const include = [...baseInclude];
+    ensureUserInclude(include);
+    const updated = await Employer.findByPk(employer.id, { include, paranoid: true });
 
-    await emp.update(payload);
-    if (Object.keys(userUpdates).length) await user.update(userUpdates);
+    await safeLog(req, {
+      category: 'employer',
+      type: 'update',
+      redirect_to: employerRedirect(updated?.id || employer.id),
+      log_text: `Employer updated: #${updated?.id || employer.id} ${updated?.name || attrs.name || '-'}`,
+    });
 
-    res.json({ success: true, data: emp });
-  } catch (e) {
-    console.error('[employers] update error:', e);
-    res.status(500).json({ success: false, message: e.message });
+    res.json({ success: true, data: updated });
+  } catch (err) {
+    console.error('[employers] update error:', err);
+    res.status(500).json({ success: false, message: err.message || 'Failed to update employer' });
   }
 });
 
 /**
  * DELETE /employers/:id
- * Soft delete an employer and mark the user as deleted.
+ * Soft delete employer.
  */
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', authenticate, async (req, res) => {
   try {
-    const emp = await Employer.findByPk(req.params.id);
-    if (!emp) return res.status(404).json({ success: false, message: 'Employer not found' });
-    const user = await User.findByPk(emp.user_id, { paranoid: false });
-    if (!user) return res.status(404).json({ success: false, message: 'Linked user not found' });
-
-    await emp.destroy();
-    await markUserAsDeleted(user);
-
-    res.json({ success: true, message: 'Employer deleted' });
-  } catch (e) {
-    console.error('[employers] delete error:', e);
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-/**
- * POST /employers/:id/request-deletion
- * Flag an employer user for deletion.
- */
-router.post('/:id/request-deletion', async (req, res) => {
-  try {
-    const employer = await Employer.findByPk(req.params.id, { paranoid: false });
-    if (!employer) return res.status(404).json({ success: false, message: 'Employer not found' });
-
-    const user = await User.findByPk(employer.user_id, { paranoid: false });
-    if (!user) return res.status(404).json({ success: false, message: 'Linked user not found' });
-
-    if (user.delete_pending) {
-      return res.json({
-        success: true,
-        message: 'Deletion already requested',
-        data: { delete_requested_at: user.delete_requested_at }
-      });
-    }
-
-    await user.update({
-      delete_pending: true,
-      delete_requested_at: new Date()
+    const adminId = getAdminId(req);
+    const employerId = Number(req.params.id);
+    const employer = employerId ? await Employer.findByPk(employerId, { paranoid: false }) : null;
+    await deleteByEmployerId(req.params.id, { deletedByAdminId: adminId ? Number(adminId) : undefined });
+    await safeLog(req, {
+      category: 'employer',
+      type: 'delete',
+      redirect_to: '/employers',
+      log_text: `Employer deleted: #${employerId || req.params.id} ${employer?.name || '-'}`
     });
-
-    res.json({ success: true, message: 'Deletion request recorded' });
-  } catch (error) {
-    console.error('[employers:request-deletion] error', error);
-    res.status(500).json({ success: false, message: error.message });
+    res.json({ success: true, message: 'Employer deleted' });
+  } catch (err) {
+    console.error('[employers] delete error:', err);
+    const status = err?.status && Number.isFinite(err.status) ? err.status : 500;
+    res.status(status).json({ success: false, message: err.message || 'Failed to delete employer' });
   }
 });
 
-// placeholders
-/**
- * GET /employers/:id/jobs
- * Placeholder endpoint for employer jobs.
- */
-router.get('/:id/jobs', (req, res) => res.json({ success: true, data: [] }));
 /**
  * GET /employers/:id/applicants
  * List applicants who interacted with the employer’s jobs.
  */
 router.get('/:id/applicants', async (req, res) => {
   try {
-    const employerId = parseInt(req.params.id);
+    const employerId = parseInt(req.params.id, 10);
     if (!employerId) return res.status(400).json({ success: false, message: 'Invalid employer id' });
 
     // Get all jobs for this employer
     const jobs = await Job.findAll({
       where: { employer_id: employerId },
-      attributes: ['id', 'job_profile_id'],
+      attributes: ['id', 'job_profile_id', 'status'],
       paranoid: false
     });
-    const jobIds = jobs.map(j => j.id);
+
+    const jobIds = jobs.map(j => j.id).filter(Boolean);
     if (!jobIds.length) return res.json({ success: true, data: [] });
 
-    // Map jobId to job_profile_id for later
-    const jobProfileIdMap = {};
-    jobs.forEach(j => { jobProfileIdMap[j.id] = j.job_profile_id; });
+    // Map jobId -> job meta
+    const jobMetaMap = {};
+    jobs.forEach(j => {
+      jobMetaMap[j.id] = { job_profile_id: j.job_profile_id, status: j.status };
+    });
 
     // Get all job_interests for these jobs
     const interests = await JobInterest.findAll({
@@ -453,19 +496,21 @@ router.get('/:id/applicants', async (req, res) => {
       paranoid: false
     });
 
-    // Collect employee IDs and job IDs
-    const employeeIds = [];
+    // Collect employee IDs
+    const employeeIdSet = new Set();
     interests.forEach(i => {
-      if (i.sender_type === 'employee') employeeIds.push(i.sender_id);
-      else if (i.sender_type === 'employer') employeeIds.push(i.receiver_id);
+      if (i.sender_type === 'employee' && i.sender_id) employeeIdSet.add(i.sender_id);
+      if (i.sender_type === 'employer' && i.receiver_id) employeeIdSet.add(i.receiver_id);
     });
 
-    // Get all employees in bulk
+    // Get all employees in bulk (join User for phone + active status)
+    const employeeIds = [...employeeIdSet];
     let employeesMap = {};
     if (employeeIds.length) {
       const employees = await Employee.findAll({
         where: { id: employeeIds },
         include: [
+          { model: User, as: 'User', attributes: ['id', 'mobile', 'is_active'], paranoid: false, required: false },
           { model: State, as: 'PreferredState', attributes: ['state_english'] },
           { model: City, as: 'PreferredCity', attributes: ['city_english'] },
           {
@@ -477,6 +522,7 @@ router.get('/:id/applicants', async (req, res) => {
         ],
         paranoid: false
       });
+
       employeesMap = {};
       employees.forEach(emp => {
         let jobProfiles = [];
@@ -488,15 +534,19 @@ router.get('/:id/applicants', async (req, res) => {
               profile_hindi: ejp.JobProfile.profile_hindi
             }));
         }
+
         employeesMap[emp.id] = {
           id: emp.id,
           name: emp.name,
+          gender: emp.gender,
           verification_status: emp.verification_status,
           kyc_status: emp.kyc_status,
           expected_salary: emp.expected_salary,
           PreferredState: emp.PreferredState,
           PreferredCity: emp.PreferredCity,
-          JobProfiles: jobProfiles
+          JobProfiles: jobProfiles,
+          mobile: emp.User?.mobile || null,
+          is_active: emp.User?.is_active
         };
       });
     }
@@ -516,10 +566,12 @@ router.get('/:id/applicants', async (req, res) => {
 
     // Compose response
     const data = interests.map(i => {
-      let employee_id = i.sender_type === 'employee' ? i.sender_id : i.receiver_id;
-      let employee = employee_id && employeesMap[employee_id] ? employeesMap[employee_id] : undefined;
+      const employee_id = i.sender_type === 'employee' ? i.sender_id : i.receiver_id;
+      const employee = employee_id && employeesMap[employee_id] ? employeesMap[employee_id] : undefined;
+
       const job_id = i.job_id;
-      const job_profile_id = jobProfileIdMap[job_id];
+      const meta = job_id ? jobMetaMap[job_id] : null;
+      const job_profile_id = meta?.job_profile_id;
       const jobProfile = job_profile_id && jobProfilesMap[job_profile_id] ? jobProfilesMap[job_profile_id] : undefined;
 
       return {
@@ -534,6 +586,7 @@ router.get('/:id/applicants', async (req, res) => {
         name: employee?.name || undefined,
         employee,
         job_id,
+        job_status: meta?.status || null,
         job_profile: jobProfile?.profile_english || jobProfile?.profile_hindi || '-',
         job_name: jobProfile?.profile_english || jobProfile?.profile_hindi || '-'
       };
@@ -561,35 +614,37 @@ router.get('/:id/credit-history', async (req, res) => {
       order: [['created_at', 'DESC']]
     });
 
-    if (!contacts.length) return res.json({ success: true, data: [] });
+    // CONTACT credits
+    const employeeIds = [...new Set(contacts.map(c => c.employee_id).filter(Boolean))];
+    const callHistoryIds = [...new Set(contacts.map(c => c.call_experience_id).filter(Boolean))];
 
-    // Collect employee_ids and call_experience_ids
-    const employeeIds = contacts.map(c => c.employee_id);
-    const callExperienceIds = contacts.map(c => c.call_experience_id).filter(Boolean);
+    const employees = employeeIds.length
+      ? await Employee.findAll({
+          where: { id: employeeIds },
+          include: [{ model: User, as: 'User', attributes: ['id', 'mobile'], required: false, paranoid: false }],
+          paranoid: false
+        })
+      : [];
 
-    // Fetch employees and their users
-    const employees = await Employee.findAll({
-      where: { id: employeeIds },
-      include: [
-        { model: User, as: 'User', attributes: ['id', 'mobile'] }
-      ],
-      paranoid: false
-    });
     const employeeMap = {};
     employees.forEach(e => { employeeMap[e.id] = e; });
 
-    // Fetch call histories for these contacts (user_type: employer)
-    const callHistories = await CallHistory.findAll({
-      where: {
-        call_experience_id: callExperienceIds,
-        user_type: 'employer'
-      },
-      paranoid: false
-    });
+    // employer_contacts.call_experience_id references call_histories.id
+    const callHistories = callHistoryIds.length
+      ? await CallHistory.findAll({
+          where: {
+            id: callHistoryIds,
+            user_type: 'employer'
+          },
+          paranoid: false
+        })
+      : [];
+
     const callHistoryMap = {};
     const experienceIds = [...new Set(callHistories.map(ch => ch.call_experience_id).filter(Boolean))];
     callHistories.forEach(ch => { callHistoryMap[ch.id] = ch; });
-    let experienceMap = {};
+
+    const experienceMap = {};
     if (experienceIds.length && EmployerCallExperience) {
       const experiences = await EmployerCallExperience.findAll({
         where: { id: experienceIds },
@@ -597,33 +652,95 @@ router.get('/:id/credit-history', async (req, res) => {
       });
       experiences.forEach(exp => { experienceMap[exp.id] = exp; });
     }
-    const data = contacts.map(c => {
+
+    const contactData = contacts.map(c => {
+      const emp = employeeMap[c.employee_id];
+      const user = emp?.User;
       const callHistory = c.call_experience_id ? callHistoryMap[c.call_experience_id] : null;
       const experience = callHistory?.call_experience_id ? experienceMap[callHistory.call_experience_id] : null;
+
       return {
         type: 'contact',
         amount: c.closing_credit ?? '-',
-        employee_id: c.employee_id, // <-- include employee_id here
+        employee_id: c.employee_id,
         employee_name: emp?.name ?? '-',
         verification_status: emp?.verification_status ?? '-',
         kyc_status: emp?.kyc_status ?? '-',
         mobile: user?.mobile ?? '-',
-        call_experience: experience?.experience_english ?? '-',
+        call_experience: experience?.experience_english || experience?.experience_hindi || '-',
         review: callHistory?.review || '-',
         date: c.created_at,
       };
     });
 
-    res.json({ success: true, data });
+    // INTEREST credits (based on job_interests sent by this employer)
+    const interests = await JobInterest.findAll({
+      where: {
+        sender_type: 'employer',
+        sender_id: employerId
+      },
+      order: [['created_at', 'DESC']],
+      paranoid: true
+    });
+
+    const interestJobIds = [...new Set(interests.map(i => i.job_id).filter(Boolean))];
+    const interestEmployeeIds = [...new Set(interests.map(i => i.receiver_id).filter(Boolean))];
+
+    const jobs = interestJobIds.length
+      ? await Job.findAll({
+          where: { id: interestJobIds },
+          include: [{ model: JobProfile, as: 'JobProfile', attributes: ['id', 'profile_english', 'profile_hindi'], required: false }],
+          paranoid: false
+        })
+      : [];
+
+    const jobsMap = {};
+    jobs.forEach(j => { jobsMap[j.id] = j; });
+
+    const interestEmployees = interestEmployeeIds.length
+      ? await Employee.findAll({
+          where: { id: interestEmployeeIds },
+          attributes: ['id', 'name'],
+          include: [{ model: User, as: 'User', attributes: ['mobile'], required: false, paranoid: false }],
+          paranoid: false
+        })
+      : [];
+
+    const interestEmployeesMap = {};
+    interestEmployees.forEach(e => { interestEmployeesMap[e.id] = e; });
+
+    const interestData = interests.map(i => {
+      const job = jobsMap[i.job_id];
+      const emp = interestEmployeesMap[i.receiver_id];
+      if (!job || !emp) return null;
+
+      return {
+        type: 'interest',
+        amount: 1,
+
+        job_id: job.id,
+        employer_id: employerId,
+        employee_id: emp.id,
+
+        job_profile: job.JobProfile?.profile_english || job.JobProfile?.profile_hindi || '-',
+        employee_name: emp.name || '-',
+        employee_mobile: emp.User?.mobile || null,
+        employee_phone: emp.User?.mobile || null,
+
+        job_status: job.status || null,
+        job_interest_status: i.status || null,
+
+        created_at: i.created_at,
+        date: i.created_at,
+      };
+    }).filter(Boolean);
+
+    res.json({ success: true, data: [...contactData, ...interestData] });
   } catch (err) {
     console.error('[employers/:id/credit-history] error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
-/**
- * GET /employers/:id/subscription-history
- * Placeholder subscription history endpoint.
- */
 router.get('/:id/subscription-history', (req, res) => res.json({ success: true, data: [] }));
 /**
  * GET /employers/:id/call-experiences
@@ -651,15 +768,19 @@ router.get('/:id/call-experiences', async (req, res) => {
     });
 
     const historyIds = histories.map(h => h.id);
+    const callExperienceIds = [...new Set(histories.map(h => h.call_experience_id).filter(Boolean))];
+
+    // Map call_experience_id -> experience row
     let expMap = {};
-    if (historyIds.length) {
+    if (callExperienceIds.length) {
       const exps = await EmployerCallExperience.findAll({
-        where: { id: historyIds },
+        where: { id: callExperienceIds },
         paranoid: false
       });
       exps.forEach(e => { expMap[e.id] = e; });
     }
 
+    // Map call_history.id -> EmployerContact (which stores employee_id)
     let contactsMap = {};
     if (historyIds.length) {
       const contacts = await EmployerContact.findAll({
@@ -681,7 +802,7 @@ router.get('/:id/call-experiences', async (req, res) => {
     }
 
     const data = histories.map(h => {
-      const contact = h.call_experience_id ? contactsMap[h.call_experience_id] : null;
+      const contact = contactsMap[h.id] || null;
       const employee = contact ? employeeMap[contact.employee_id] : null;
       const exp = h.call_experience_id ? expMap[h.call_experience_id] : null;
       return {
@@ -692,7 +813,7 @@ router.get('/:id/call-experiences', async (req, res) => {
         read_at: h.read_at,
         created_at: h.created_at,
         employee_id: employee?.id,
-        employee_name: employee?.name || '-'
+        employee_name: employee?.name || '-',
       };
     });
 
@@ -757,6 +878,7 @@ router.get('/:id/voilation-reports', async (req, res) => {
     if (reportJobIds.length) {
       const jobsData = await Job.findAll({
         where: { id: reportJobIds },
+        attributes: ['id', 'status'],
         include: [
           { model: JobProfile, as: 'JobProfile', attributes: ['id', 'profile_english'] }
         ],
@@ -790,6 +912,7 @@ router.get('/:id/voilation-reports', async (req, res) => {
         employee_name: employee?.name || '-',
         job_id: r.report_id,
         job_profile: job?.JobProfile?.profile_english || '-',
+        job_status: job?.status || null,
         reason_english: reason?.reason_english || '-',
         reason_hindi: reason?.reason_hindi || '',
         description: r.description || '',
@@ -799,6 +922,7 @@ router.get('/:id/voilation-reports', async (req, res) => {
         user: employee ? { id: employee.id, name: employee.name } : null,
         reported_entity: job ? {
           id: job.id,
+          status: job.status || null,
           JobProfile: job.JobProfile || null
         } : null,
         reason: reason ? {
@@ -929,7 +1053,27 @@ const handleEmployerStatusMutation = async (req, res, field, value, message) => 
   try {
     const employer = await Employer.findByPk(req.params.id, { paranoid: false });
     if (!employer) return res.status(404).json({ success: false, message: 'Employer not found' });
-    await employer.update({ [field]: value });
+
+    const payload = { [field]: value };
+
+    // NEW: stamp timestamps when statuses change via these endpoints
+    if (field === 'verification_status') {
+      payload.verification_at = (value === 'verified' || value === 'rejected') ? new Date() : null;
+    }
+    if (field === 'kyc_status') {
+      payload.kyc_verification_at = (value === 'verified' || value === 'rejected') ? new Date() : null;
+    }
+
+    await employer.update(payload);
+
+    const statusLabel = field === 'verification_status' ? 'verification' : field === 'kyc_status' ? 'kyc' : field;
+    await safeLog(req, {
+      category: 'employer',
+      type: 'update',
+      redirect_to: employerRedirect(employer.id),
+      log_text: `Employer ${statusLabel} updated: #${employer.id} -> ${value}`,
+    });
+
     res.json({ success: true, message });
   } catch (error) {
     console.error(`[employers:${field}] error`, error);
@@ -941,17 +1085,34 @@ const handleEmployerStatusMutation = async (req, res, field, value, message) => 
  * POST /employers/:id/activate
  * Activate an employer’s user account.
  */
-router.post('/:id/activate', async (req, res) => {
+router.post('/:id/activate', authenticate, async (req, res) => {
   try {
-    const employer = await fetchEmployerWithUser(req.params.id);
+    const employerId = Number(req.params.id);
+    if (!employerId) return res.status(400).json({ success: false, message: 'Invalid employer id' });
+
+    const employer = await Employer.findByPk(employerId);
     if (!employer) return res.status(404).json({ success: false, message: 'Employer not found' });
-    const user = await ensureEmployerUser(employer);
+
+    const user = await User.findByPk(employer.user_id, { paranoid: false });
     if (!user) return res.status(404).json({ success: false, message: 'Linked user not found' });
-    await user.update({ is_active: true });
-    res.json({ success: true, message: 'Employer activated' });
+
+    await user.update({
+      is_active: true,
+      deactivation_reason: null,
+      status_change_by: getAdminId(req),
+    });
+
+    await safeLog(req, {
+      category: 'employer',
+      type: 'update',
+      redirect_to: employerRedirect(employer.id),
+      log_text: `Employer activated: #${employer.id} ${employer.name || '-'}`,
+    });
+
+    return res.json({ success: true, message: 'Employer activated', data: { user_id: user.id, employer_id: employer.id } });
   } catch (error) {
     console.error('[employers:activate] error', error);
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: error.message || 'Activate failed' });
   }
 });
 
@@ -959,17 +1120,37 @@ router.post('/:id/activate', async (req, res) => {
  * POST /employers/:id/deactivate
  * Deactivate an employer’s user account.
  */
-router.post('/:id/deactivate', async (req, res) => {
+router.post('/:id/deactivate', authenticate, async (req, res) => {
   try {
-    const employer = await fetchEmployerWithUser(req.params.id);
+    const employerId = Number(req.params.id);
+    if (!employerId) return res.status(400).json({ success: false, message: 'Invalid employer id' });
+
+    const reason = (req.body?.deactivation_reason || '').toString().trim();
+    if (!reason) return res.status(400).json({ success: false, message: 'deactivation_reason is required' });
+
+    const employer = await Employer.findByPk(employerId);
     if (!employer) return res.status(404).json({ success: false, message: 'Employer not found' });
-    const user = await ensureEmployerUser(employer);
+
+    const user = await User.findByPk(employer.user_id, { paranoid: false });
     if (!user) return res.status(404).json({ success: false, message: 'Linked user not found' });
-    await user.update({ is_active: false });
-    res.json({ success: true, message: 'Employer deactivated' });
+
+    await user.update({
+      is_active: false,
+      deactivation_reason: reason,
+      status_change_by: getAdminId(req),
+    });
+
+    await safeLog(req, {
+      category: 'employer',
+      type: 'update',
+      redirect_to: employerRedirect(employer.id),
+      log_text: `Employer deactivated: #${employer.id} ${employer.name || '-'} reason=${reason}`,
+    });
+
+    return res.json({ success: true, message: 'Employer deactivated', data: { user_id: user.id, employer_id: employer.id } });
   } catch (error) {
     console.error('[employers:deactivate] error', error);
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: error.message || 'Deactivate failed' });
   }
 });
 
@@ -977,7 +1158,7 @@ router.post('/:id/deactivate', async (req, res) => {
  * POST /employers/:id/approve
  * Mark an employer’s verification status as verified.
  */
-router.post('/:id/approve', (req, res) =>
+router.post('/:id/approve', authenticate, (req, res) =>
   handleEmployerStatusMutation(req, res, 'verification_status', 'verified', 'Verification marked as verified')
 );
 
@@ -985,7 +1166,7 @@ router.post('/:id/approve', (req, res) =>
  * POST /employers/:id/reject
  * Mark an employer’s verification as rejected.
  */
-router.post('/:id/reject', (req, res) =>
+router.post('/:id/reject', authenticate, (req, res) =>
   handleEmployerStatusMutation(req, res, 'verification_status', 'rejected', 'Verification rejected')
 );
 
@@ -993,7 +1174,7 @@ router.post('/:id/reject', (req, res) =>
  * POST /employers/:id/kyc/grant
  * Approve KYC for an employer.
  */
-router.post('/:id/kyc/grant', (req, res) =>
+router.post('/:id/kyc/grant', authenticate, (req, res) =>
   handleEmployerStatusMutation(req, res, 'kyc_status', 'verified', 'KYC marked as verified')
 );
 
@@ -1001,7 +1182,7 @@ router.post('/:id/kyc/grant', (req, res) =>
  * POST /employers/:id/kyc/reject
  * Reject KYC for an employer.
  */
-router.post('/:id/kyc/reject', (req, res) =>
+router.post('/:id/kyc/reject', authenticate, (req, res) =>
   handleEmployerStatusMutation(req, res, 'kyc_status', 'rejected', 'KYC rejected')
 );
 
@@ -1009,7 +1190,7 @@ router.post('/:id/kyc/reject', (req, res) =>
  * POST /employers/:id/change-subscription
  * Switch an employer to a different subscription plan.
  */
-router.post('/:id/change-subscription', async (req, res) => {
+router.post('/:id/change-subscription', authenticate, async (req, res) => {
   try {
     const { subscription_plan_id } = req.body || {};
     if (!subscription_plan_id) {
@@ -1037,6 +1218,19 @@ router.post('/:id/change-subscription', async (req, res) => {
       credit_expiry_at: expiryAt,
     });
 
+
+    await safeLog(req, {
+      category: 'employer subscription',
+      type: 'update',
+      redirect_to: employerRedirect(employer.id),
+      log_text: `Employer subscription changed: #${employer.id} plan_id=${plan.id}`,
+    });
+    await safeLog(req, {
+      category: 'employer',
+      type: 'update',
+      redirect_to: employerRedirect(employer.id),
+      log_text: `Employer subscription changed: #${employer.id} plan_id=${plan.id}`,
+    });
     res.json({
       success: true,
       message: 'Subscription updated',
@@ -1058,7 +1252,7 @@ router.post('/:id/change-subscription', async (req, res) => {
  * POST /employers/:id/add-credits
  * Add credits to an employer account.
  */
-router.post('/:id/add-credits', async (req, res) => {
+router.post('/:id/add-credits', authenticate, async (req, res) => {
   try {
     const contactDelta = Number(req.body?.contact_credits) || 0;
     const interestDelta = Number(req.body?.interest_credits) || 0;
@@ -1081,6 +1275,19 @@ router.post('/:id/add-credits', async (req, res) => {
     }
 
     await employer.update(updatePayload);
+
+    await safeLog(req, {
+      category: 'employer subscription',
+      type: 'update',
+      redirect_to: employerRedirect(employer.id),
+      log_text: `Employer credits added: #${employer.id} contact=${contactDelta} interest=${interestDelta} ad=${adDelta}`,
+    });
+    await safeLog(req, {
+      category: 'employer',
+      type: 'update',
+      redirect_to: employerRedirect(employer.id),
+      log_text: `Employer credits added: #${employer.id} contact=${contactDelta} interest=${interestDelta} ad=${adDelta}`,
+    });
 
     res.json({
       success: true,
@@ -1126,6 +1333,9 @@ router.get('/:id/voilations-reported', async (req, res) => {
       ? await Employee.findAll({
           where: { id: employeeIds },
           attributes: ['id', 'name'],
+          include: [
+            { model: User, as: 'User', attributes: ['id', 'is_active'], paranoid: false, required: false }
+          ],
           paranoid: false
         })
       : [];
@@ -1149,6 +1359,7 @@ router.get('/:id/voilations-reported', async (req, res) => {
         id: r.id,
         employee_id: r.report_id,
         employee_name: employee?.name || '-',
+        employee_is_active: employee?.User?.is_active ?? null,
         reason_english: reason?.reason_english || '-',
         reason_hindi: reason?.reason_hindi || '',
         description: r.description || '',

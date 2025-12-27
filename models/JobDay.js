@@ -12,7 +12,7 @@ const JobDay = sequelize.define('JobDay', {
   day: {
     type: DataTypes.STRING,
     allowNull: false,
-    comment: 'Numeric 1-7 or weekday name (e.g. 1, Monday, Tue)',
+    comment: 'Numeric 1-7 or weekday name (e.g. 1, Monday, Tue). UI may render as Mon,Tue,Wed.',
   },
 }, {
   tableName: 'job_days',
@@ -20,5 +20,8 @@ const JobDay = sequelize.define('JobDay', {
   updatedAt: false,
   createdAt: 'created_at',
 });
+
+// NOTE: Vacancies UI uses Job.hired_total/no_vacancy (not related to JobDay).
+// (no changes needed; expired-logic is handled in backend/routes/jobs.js)
 
 module.exports = JobDay;

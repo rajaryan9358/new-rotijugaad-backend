@@ -35,6 +35,14 @@ const Experience = sequelize.define('Experience', {
     type: DataTypes.DATE,
     allowNull: true,
   },
+  exp_type: {
+    type: DataTypes.ENUM('month', 'year'),
+    allowNull: false,
+    defaultValue: 'year',
+    validate: {
+      isIn: [['month', 'year']],
+    },
+  },
 }, {
   tableName: 'experiences',
   timestamps: true,

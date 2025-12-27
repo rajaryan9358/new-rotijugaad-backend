@@ -1,9 +1,25 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
 const Admin = require('../models/Admin');
 const Role = require('../models/Role');
+const Log = require('../models/Log');
+const getAdminId = require('../utils/getAdminId');
 
 const router = express.Router();
+
+
+const safeCreateLog = (req, payload) => {
+  try {
+    return Log.create({
+      category: payload.category,
+      type: payload.type,
+      redirect_to: payload.redirect_to || null,
+      log_text: payload.log_text || null,
+      rj_employee_id: payload?.rj_employee_id ?? getAdminId(req) ?? null,
+    }).catch(() => null);
+  } catch (_) {
+    return Promise.resolve(null);
+  }
+};
 
 
 const normalizePermissions = (input) => {
@@ -65,6 +81,14 @@ router.post('/roles', async (req, res) => {
       permissions: permissions.length ? permissions : ['*']
     });
 
+
+    void safeCreateLog(req, {
+      category: 'roles',
+      type: 'add',
+      redirect_to: '/roles',
+      log_text: `Created role "${role.name}" (slug: ${role.slug}) (id: ${role.id}) with ${(Array.isArray(role.permissions) ? role.permissions.length : 0)} permission(s)`,
+    });
+
     res.status(201).json({ success: true, data: role });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to create role', error: error.message });
@@ -81,12 +105,34 @@ router.put('/roles/:id', async (req, res) => {
     const role = await Role.findByPk(req.params.id);
     if (!role) return res.status(404).json({ success: false, message: 'Role not found' });
 
+    const before = role.toJSON();
+
     const normalized = permissions === undefined ? role.permissions : normalizePermissions(permissions);
 
     await role.update({
       name: name ? name.trim() : role.name,
       permissions: normalized
     });
+
+
+    try {
+      const nextName = name ? name.trim() : before.name;
+      const nextPermissions = permissions === undefined ? before.permissions : normalized;
+      const changeParts = [];
+      if (nextName !== before.name) changeParts.push(`name: "${before.name}" → "${nextName}"`);
+      if (JSON.stringify(nextPermissions) != JSON.stringify(before.permissions)) {
+        const prevLen = Array.isArray(before.permissions) ? before.permissions.length : 0;
+        const nextLen = Array.isArray(nextPermissions) ? nextPermissions.length : 0;
+        changeParts.push(`permissions updated (${prevLen} → ${nextLen})`);
+      }
+      const changesText = changeParts.length ? `; changes: ${changeParts.join(', ')}` : '';
+      void safeCreateLog(req, {
+        category: 'roles',
+        type: 'update',
+        redirect_to: '/roles',
+        log_text: `Updated role "${nextName}" (slug: ${role.slug}) (id: ${role.id})${changesText}`,
+      });
+    } catch (_) {}
 
     res.json({ success: true, data: role });
   } catch (error) {
@@ -103,12 +149,21 @@ router.delete('/roles/:id', async (req, res) => {
     const role = await Role.findByPk(req.params.id);
     if (!role) return res.status(404).json({ success: false, message: 'Role not found' });
 
+
     const adminsUsingRole = await Admin.count({ where: { role_id: role.id } });
     if (adminsUsingRole) {
       return res.status(400).json({ success: false, message: 'Cannot delete role in use by admins' });
     }
 
     await role.destroy();
+
+    void safeCreateLog(req, {
+      category: 'roles',
+      type: 'delete',
+      redirect_to: '/roles',
+      log_text: `Deleted role "${role.name}" (slug: ${role.slug}) (id: ${role.id})`,
+    });
+
     res.json({ success: true, message: 'Role deleted' });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to delete role', error: error.message });
@@ -129,8 +184,15 @@ router.post('/', async (req, res) => {
     if (!name || !email || !password || !role_id) {
       return res.status(400).json({ success: false, message: 'Name, email, password and role are required' });
     }
-    const hashed = await bcrypt.hash(password, 10);
-    const admin = await Admin.create({ name, email, password: hashed, role: 'admin', role_id });
+    const admin = await Admin.create({ name, email, password, role: 'admin', role_id });
+
+    void safeCreateLog(req, {
+      category: 'admin',
+      type: 'add',
+      redirect_to: '/admins',
+      log_text: `Created admin "${admin.name}" (${admin.email}) (id: ${admin.id}) role_id=${admin.role_id}`,
+    });
+
     res.status(201).json({ success: true, data: admin });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to create admin', error: error.message });
@@ -143,16 +205,45 @@ router.post('/', async (req, res) => {
  */
 router.put('/:id', async (req, res) => {
   try {
-    const { name, email, role_id, is_active } = req.body;
+    const { name, email, password, role_id, is_active } = req.body;
     const admin = await Admin.findByPk(req.params.id);
     if (!admin) return res.status(404).json({ success: false, message: 'Admin not found' });
 
-    await admin.update({
+    const before = admin.toJSON();
+
+    const updates = {
       name: name ?? admin.name,
       email: email ?? admin.email,
       role_id: role_id ?? admin.role_id,
       is_active: typeof is_active === 'boolean' ? is_active : admin.is_active
-    });
+    };
+
+    if (typeof password === 'string' && password.length) {
+      updates.password = password;
+    }
+
+    await admin.update(updates);
+
+    try {
+      const changeParts = [];
+      if (updates.name !== before.name) changeParts.push(`name: "${before.name}" → "${updates.name}"`);
+      if (updates.email !== before.email) changeParts.push(`email: "${before.email}" → "${updates.email}"`);
+      if (updates.role_id !== before.role_id) changeParts.push(`role_id: ${before.role_id} → ${updates.role_id}`);
+      if (updates.password) changeParts.push('password changed');
+      if (typeof updates.is_active === 'boolean' && updates.is_active !== before.is_active) {
+        changeParts.push(`is_active: ${before.is_active} → ${updates.is_active}`);
+      }
+      const didToggleActive = typeof updates.is_active === 'boolean' && updates.is_active !== before.is_active;
+      const verb = didToggleActive ? (updates.is_active ? 'Activated' : 'Deactivated') : 'Updated';
+      const changesText = changeParts.length ? `; changes: ${changeParts.join(', ')}` : '';
+      void safeCreateLog(req, {
+        category: 'admin',
+        type: 'update',
+        redirect_to: '/admins',
+        log_text: `${verb} admin ${admin.id} (${admin.email})${changesText}`,
+      });
+    } catch (_) {}
+
     res.json({ success: true, data: admin });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to update admin', error: error.message });
@@ -169,6 +260,14 @@ router.delete('/:id', async (req, res) => {
     if (!admin) return res.status(404).json({ success: false, message: 'Admin not found' });
 
     await admin.update({ is_active: false });
+
+    void safeCreateLog(req, {
+      category: 'admin',
+      type: 'delete',
+      redirect_to: '/admins',
+      log_text: `Deactivated admin ${admin.id} (${admin.email}) (soft delete)`,
+    });
+
     res.json({ success: true, message: 'Admin deactivated' });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to delete admin', error: error.message });

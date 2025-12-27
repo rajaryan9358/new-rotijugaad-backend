@@ -11,6 +11,21 @@ const PlanBenefit = require('../models/PlanBenefit');
 const { handleSelfieUpload } = require('../utils/selfieUpload');
 const { Op } = require('sequelize');
 
+const Log = require('../models/Log');
+const getAdminId = require('../utils/getAdminId');
+
+const safeCreateLog = async (req, payload) => {
+  try {
+    await Log.create({
+      ...payload,
+      rj_employee_id: payload?.rj_employee_id ?? getAdminId(req) ?? null,
+    });
+  } catch (error) {
+    console.error('[subscriptions] audit log failed:', error?.message || error);
+  }
+};
+
+
 /**
  * POST /upload/selfie
  * Upload a selfie image for storage and verification.
@@ -132,6 +147,14 @@ router.post('/employee-plans', async (req, res) => {
       is_active: is_active !== undefined ? !!is_active : true,
     });
 
+
+    await safeCreateLog(req, {
+      category: 'employee subscription plan',
+      type: 'add',
+      redirect_to: '/subscriptions/employee',
+      log_text: `Created employee subscription plan: ${plan.plan_name_english || '-'} (ID: ${plan.id})`,
+    });
+
     res.status(201).json({ success: true, data: plan });
   } catch (error) {
     console.error('Employee Plan create error:', error);
@@ -158,6 +181,14 @@ router.put('/employee-plans/:id', async (req, res) => {
     if (payload.is_active !== undefined) payload.is_active = !!payload.is_active;
 
     await plan.update(payload);
+
+    await safeCreateLog(req, {
+      category: 'employee subscription plan',
+      type: 'update',
+      redirect_to: '/subscriptions/employee',
+      log_text: `Updated employee subscription plan: ${plan.plan_name_english || '-'} (ID: ${plan.id})`,
+    });
+
     res.json({ success: true, data: plan });
   } catch (error) {
     console.error('Employee Plan update error:', error);
@@ -173,7 +204,16 @@ router.delete('/employee-plans/:id', async (req, res) => {
   try {
     const plan = await EmployeeSubscriptionPlan.findByPk(req.params.id);
     if (!plan) return res.status(404).json({ success: false, message: 'Plan not found' });
+    const planName = plan.plan_name_english || plan.plan_name_hindi || '';
     await plan.destroy();
+
+    await safeCreateLog(req, {
+      category: 'employee subscription plan',
+      type: 'delete',
+      redirect_to: '/subscriptions/employee',
+      log_text: `Deleted employee subscription plan: ${planName || '-'} (ID: ${plan.id})`,
+    });
+
     res.json({ success: true, message: 'Plan deleted successfully' });
   } catch (error) {
     console.error('Employee Plan delete error:', error);
@@ -272,6 +312,14 @@ router.post('/employer-plans', async (req, res) => {
       is_active: is_active !== undefined ? !!is_active : true,
     });
 
+
+    await safeCreateLog(req, {
+      category: 'employer subscription plan',
+      type: 'add',
+      redirect_to: '/subscriptions/employer',
+      log_text: `Created employer subscription plan: ${plan.plan_name_english || '-'} (ID: ${plan.id})`,
+    });
+
     res.status(201).json({ success: true, data: plan });
   } catch (error) {
     console.error('Employer Plan create error:', error);
@@ -299,6 +347,14 @@ router.put('/employer-plans/:id', async (req, res) => {
     if (payload.is_active !== undefined) payload.is_active = !!payload.is_active;
 
     await plan.update(payload);
+
+    await safeCreateLog(req, {
+      category: 'employer subscription plan',
+      type: 'update',
+      redirect_to: '/subscriptions/employer',
+      log_text: `Updated employer subscription plan: ${plan.plan_name_english || '-'} (ID: ${plan.id})`,
+    });
+
     res.json({ success: true, data: plan });
   } catch (error) {
     console.error('Employer Plan update error:', error);
@@ -314,7 +370,16 @@ router.delete('/employer-plans/:id', async (req, res) => {
   try {
     const plan = await EmployerSubscriptionPlan.findByPk(req.params.id);
     if (!plan) return res.status(404).json({ success: false, message: 'Plan not found' });
+    const planName = plan.plan_name_english || plan.plan_name_hindi || '';
     await plan.destroy();
+
+    await safeCreateLog(req, {
+      category: 'employer subscription plan',
+      type: 'delete',
+      redirect_to: '/subscriptions/employer',
+      log_text: `Deleted employer subscription plan: ${planName || '-'} (ID: ${plan.id})`,
+    });
+
     res.json({ success: true, message: 'Plan deleted successfully' });
   } catch (error) {
     console.error('Employer Plan delete error:', error);
@@ -449,6 +514,14 @@ router.post('/plan-benefits', async (req, res) => {
       is_active: is_active !== undefined ? !!is_active : true,
     });
 
+
+    await safeCreateLog(req, {
+      category: 'plan benefits',
+      type: 'add',
+      redirect_to: '/subscriptions/plan-benefits',
+      log_text: `Created plan benefit: ${benefit.benefit_english || '-'} (ID: ${benefit.id}) for ${benefit.subscription_type} plan ${benefit.plan_id}`,
+    });
+
     res.status(201).json({ success: true, data: benefit });
   } catch (error) {
     console.error('Plan Benefit create error:', error);
@@ -471,6 +544,14 @@ router.put('/plan-benefits/:id', async (req, res) => {
     if (payload.is_active !== undefined) payload.is_active = !!payload.is_active;
 
     await benefit.update(payload);
+
+    await safeCreateLog(req, {
+      category: 'plan benefits',
+      type: 'update',
+      redirect_to: '/subscriptions/plan-benefits',
+      log_text: `Updated plan benefit: ${benefit.benefit_english || '-'} (ID: ${benefit.id})`,
+    });
+
     res.json({ success: true, data: benefit });
   } catch (error) {
     console.error('Plan Benefit update error:', error);
@@ -486,7 +567,18 @@ router.delete('/plan-benefits/:id', async (req, res) => {
   try {
     const benefit = await PlanBenefit.findByPk(req.params.id);
     if (!benefit) return res.status(404).json({ success: false, message: 'Benefit not found' });
+    const benefitText = benefit.benefit_english || benefit.benefit_hindi || '';
+    const subType = benefit.subscription_type;
+    const planId = benefit.plan_id;
     await benefit.destroy();
+
+    await safeCreateLog(req, {
+      category: 'plan benefits',
+      type: 'delete',
+      redirect_to: '/subscriptions/plan-benefits',
+      log_text: `Deleted plan benefit: ${benefitText || '-'} (ID: ${benefit.id}) for ${subType} plan ${planId}`,
+    });
+
     res.json({ success: true, message: 'Benefit deleted successfully' });
   } catch (error) {
     console.error('Plan Benefit delete error:', error);

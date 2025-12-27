@@ -1,6 +1,16 @@
 const { DataTypes } = require('sequelize');
 const { sequelize } = require('../config/db');
 
+/**
+ * Migration SQL (run once):
+ *   ALTER TABLE call_histories
+ *     ADD COLUMN called_id INT NULL AFTER user_id;
+ *
+ * Optional (recommended) indexes:
+ *   CREATE INDEX idx_call_histories_user_type_created_at ON call_histories (user_type, created_at);
+ *   CREATE INDEX idx_call_histories_user_type_called_id ON call_histories (user_type, called_id);
+ */
+
 const CallHistory = sequelize.define('CallHistory', {
   id: { 
     type: DataTypes.INTEGER, 
@@ -18,6 +28,12 @@ const CallHistory = sequelize.define('CallHistory', {
     type: DataTypes.INTEGER,
     allowNull: false,
     comment: 'Employee ID when user_type=employee, Employer ID when user_type=employer',
+  },
+
+  called_id: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    comment: 'If user_type=employee => called_id is job_id; if user_type=employer => called_id is employee_id',
   },
 
   call_experience_id: {

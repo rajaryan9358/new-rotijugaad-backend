@@ -15,7 +15,14 @@ const Job = require('../models/Job');
 const Wishlist = require('../models/Wishlist');
 const PaymentHistory = require('../models/PaymentHistory');
 const CallHistory = require('../models/CallHistory');
+const DeletedUser = require('../models/DeletedUser');
 const markUserAsDeleted = require('../utils/markUserAsDeleted');
+const getAdminId = require('../utils/getAdminId');
+const Log = require('../models/Log');
+const { deleteByUserId } = require('../utils/deleteUserTransactional');
+
+// NEW: join users.status_change_by -> admins.id to show admin name in UsersManagement
+const Admin = require('../models/Admin');
 
 const LAST_ACTIVE_SINCE_OPTIONS = new Set([7, 15, 30, 90, 180, 365]);
 const NEW_USER_WINDOW_MS = 48 * 60 * 60 * 1000;
@@ -29,7 +36,8 @@ const SORTABLE_USER_FIELDS = new Set([
   'referral_code',
   'total_referred',
   'is_active',
-  'created_at'
+  'created_at',
+  'profile_completed_at'
 ]);
 const STATUS_TARGETS = ['employee', 'employer'];
 
@@ -52,6 +60,24 @@ async function collectStatusUserIds(field, value, userType) {
 router.use(express.json({ limit: '10mb' }));
 router.use(express.urlencoded({ limit: '10mb', extended: true }));
 
+const safeCreateLog = async (payload) => {
+  try {
+    await Log.create(payload);
+  } catch (error) {
+    console.error('[logs] failed to create log', error);
+  }
+};
+
+const safeLog = async (req, { category, type, redirect_to, log_text }) => {
+  return safeCreateLog({
+    category,
+    type,
+    redirect_to: redirect_to || null,
+    log_text: log_text || null,
+    rj_employee_id: getAdminId(req),
+  });
+};
+
 /**
  * GET /users/deletion-requests
  * List users who have pending deletion requests.
@@ -61,12 +87,44 @@ router.get('/deletion-requests', async (req, res) => {
     const search = (req.query.search || '').trim();
     const userType = (req.query.user_type || '').toLowerCase();
     const newFilter = (req.query.newFilter || '').toLowerCase();
-    const where = { delete_pending: true };
+
+    const createdFromRaw = (req.query.created_from ?? req.query.createdFrom ?? '').toString().trim();
+    const createdToRaw = (req.query.created_to ?? req.query.createdTo ?? '').toString().trim();
+
+    const normalizeDateOnlyOrNull = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+    const startOfDay = (d) => {
+      if (!d) return null;
+      const x = new Date(d);
+      x.setHours(0, 0, 0, 0);
+      return x;
+    };
+    const endExclusiveOfDay = (d) => {
+      if (!d) return null;
+      const x = startOfDay(d);
+      x.setDate(x.getDate() + 1);
+      return x;
+    };
+
+    const where = { delete_pending: true, deleted_at: { [Op.is]: null } };
     if (['employee', 'employer'].includes(userType)) where.user_type = userType;
     if (newFilter === 'new') {
       where.created_at = {
         ...(where.created_at || {}),
         [Op.gte]: new Date(Date.now() - NEW_USER_WINDOW_MS)
+      };
+    }
+
+    const createdFrom = startOfDay(normalizeDateOnlyOrNull(createdFromRaw));
+    const createdToExclusive = endExclusiveOfDay(normalizeDateOnlyOrNull(createdToRaw));
+    if (createdFrom || createdToExclusive) {
+      where.created_at = {
+        ...(where.created_at || {}),
+        ...(createdFrom ? { [Op.gte]: createdFrom } : {}),
+        ...(createdToExclusive ? { [Op.lt]: createdToExclusive } : {})
       };
     }
     if (search) {
@@ -114,58 +172,115 @@ router.get('/deletion-requests', async (req, res) => {
 
 /**
  * GET /users/deleted
- * Retrieve all soft-deleted users.
+ * Retrieve deleted users from deleted_users audit table.
  */
 router.get('/deleted', async (req, res) => {
   try {
     const search = (req.query.search || '').trim();
     const userType = (req.query.user_type || '').toLowerCase();
     const newFilter = (req.query.newFilter || '').toLowerCase();
-    const where = { deleted_at: { [Op.ne]: null } };
+
+    const createdFromRaw = (req.query.created_from ?? req.query.createdFrom ?? '').toString().trim();
+    const createdToRaw = (req.query.created_to ?? req.query.createdTo ?? '').toString().trim();
+
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limitParam = parseInt(req.query.limit, 10);
+    const limit = Math.min(Math.max(limitParam || 200, 1), 500);
+    const offset = (page - 1) * limit;
+
+    const parseDateOnly = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+
+    const startOfDay = (d) => {
+      if (!d) return null;
+      const x = new Date(d);
+      x.setHours(0, 0, 0, 0);
+      return x;
+    };
+
+    const endExclusiveOfDay = (d) => {
+      if (!d) return null;
+      const x = startOfDay(d);
+      x.setDate(x.getDate() + 1);
+      return x;
+    };
+
+    const createdFrom = parseDateOnly(createdFromRaw);
+    const createdTo = parseDateOnly(createdToRaw);
+
+    const where = {};
     if (['employee', 'employer'].includes(userType)) where.user_type = userType;
+
     if (newFilter === 'new') {
       where.created_at = {
         ...(where.created_at || {}),
         [Op.gte]: new Date(Date.now() - NEW_USER_WINDOW_MS)
       };
     }
+
+    if (createdFrom) {
+      where.created_at = {
+        ...(where.created_at || {}),
+        [Op.gte]: startOfDay(createdFrom)
+      };
+    }
+
+    if (createdTo) {
+      where.created_at = {
+        ...(where.created_at || {}),
+        [Op.lt]: endExclusiveOfDay(createdTo)
+      };
+    }
+
     if (search) {
       const like = { [Op.like]: `%${search}%` };
-      const clauses = [{ name: like }, { mobile: like }];
+      const clauses = [
+        { name: like },
+        { mobile: like },
+        { referred_by: like },
+        { organization_type: like },
+        { organization_name: like },
+        { business_category: like },
+        { email: like }
+      ];
       const numeric = Number(search);
       if (!Number.isNaN(numeric)) clauses.push({ id: numeric });
       where[Op.or] = clauses;
     }
 
-    const users = await User.findAll({
+    const result = await DeletedUser.findAndCountAll({
       where,
-      order: [['deleted_at', 'DESC']],
-      paranoid: false
+      order: [['deleted_at', 'DESC'], ['id', 'DESC']],
+      limit,
+      offset
     });
-    if (!users.length) return res.json({ success: true, data: [] });
 
-    const userIds = users.map(u => u.id);
-    const [employees, employers] = await Promise.all([
-      Employee.findAll({ where: { user_id: userIds }, paranoid: false }),
-      Employer.findAll({ where: { user_id: userIds }, paranoid: false })
-    ]);
-    const employeeByUser = new Map(employees.map(e => [e.user_id, e]));
-    const employerByUser = new Map(employers.map(e => [e.user_id, e]));
+    const rawRows = (result.rows || []).map((row) => row.toJSON());
 
-    const data = users.map(u => ({
-      id: u.id,
-      name: u.name,
-      mobile: u.mobile,
-      user_type: u.user_type,
-      deleted_at: u.deleted_at,
-      entity: u.user_type === 'employee'
-        ? employeeByUser.get(u.id) || null
-        : employerByUser.get(u.id) || null,
-      created_at: u.created_at,
-      last_active_at: u.last_active_at
+    // Attach DeletedBy (Admin) name.
+    const adminIds = [...new Set(rawRows.map(r => Number(r.deleted_by)).filter(n => Number.isFinite(n) && n > 0))];
+    let adminMap = new Map();
+    if (adminIds.length) {
+      const admins = await Admin.findAll({ where: { id: adminIds }, attributes: ['id', 'name'] });
+      adminMap = new Map(admins.map(a => [a.id, a.name]));
+    }
+
+    const data = rawRows.map((r) => ({
+      ...r,
+      DeletedBy: r.deleted_by ? { id: r.deleted_by, name: adminMap.get(Number(r.deleted_by)) || null } : null
     }));
 
-    res.json({ success: true, data });
+    const total = result.count || 0;
+    const totalPages = limit ? Math.max(Math.ceil(total / limit), 1) : 1;
+
+    res.json({
+      success: true,
+      data,
+      meta: { page, limit, total, totalPages }
+    });
   } catch (error) {
     console.error('[users:deleted] error', error);
     res.status(500).json({ success: false, message: error.message });
@@ -174,7 +289,7 @@ router.get('/deleted', async (req, res) => {
 
 /**
  * POST /users/:id/delete-permanently
- * Hard delete a user and purge all related data.
+ * Accept deletion request and apply standard delete logic.
  */
 router.post('/:id/delete-permanently', async (req, res) => {
   const userId = Number(req.params.id);
@@ -187,88 +302,26 @@ router.post('/:id/delete-permanently', async (req, res) => {
   }
 
   try {
-    await sequelize.transaction(async (transaction) => {
-      if (user.user_type === 'employee') {
-        const employee = await Employee.findOne({
-          where: { user_id: user.id },
-          paranoid: false,
-          transaction
-        });
-        if (employee) {
-          const employeeId = employee.id;
-          await Promise.all([
-            EmployeeExperience.destroy({ where: { user_id: employeeId }, force: true, transaction }),
-            EmployeeDocument.destroy({ where: { user_id: employeeId }, force: true, transaction }),
-            EmployeeJobProfile.destroy({ where: { employee_id: employeeId }, force: true, transaction }),
-            EmployeeContact.destroy({ where: { employee_id: employeeId }, force: true, transaction }),
-            Wishlist.destroy({ where: { employee_id: employeeId }, force: true, transaction }),
-            JobInterest.destroy({
-              where: {
-                [Op.or]: [
-                  { sender_type: 'employee', sender_id: employeeId },
-                  { receiver_id: employeeId }
-                ]
-              },
-              force: true,
-              transaction
-            }),
-            PaymentHistory.destroy({
-              where: { user_type: 'employee', user_id: employeeId },
-              force: true,
-              transaction
-            }),
-            CallHistory.destroy({
-              where: { user_type: 'employee', user_id: employeeId },
-              force: true,
-              transaction
-            })
-          ]);
-          await employee.destroy({ force: true, transaction });
-        }
-      } else if (user.user_type === 'employer') {
-        const employer = await Employer.findOne({
-          where: { user_id: user.id },
-          paranoid: false,
-          transaction
-        });
-        if (employer) {
-          const employerId = employer.id;
-          await Promise.all([
-            EmployerContact.destroy({ where: { employer_id: employerId }, force: true, transaction }),
-            Job.destroy({ where: { employer_id: employerId }, force: true, transaction }),
-            JobInterest.destroy({
-              where: {
-                [Op.or]: [
-                  { sender_type: 'employer', sender_id: employerId },
-                  { receiver_id: employerId }
-                ]
-              },
-              force: true,
-              transaction
-            }),
-            PaymentHistory.destroy({
-              where: { user_type: 'employer', user_id: employerId },
-              force: true,
-              transaction
-            }),
-            CallHistory.destroy({
-              where: { user_type: 'employer', user_id: employerId },
-              force: true,
-              transaction
-            })
-          ]);
-          await employer.destroy({ force: true, transaction });
-        }
-      }
-
-      await markUserAsDeleted(user, transaction);
-      await wipeUserData(user, transaction);
+    const adminId = getAdminId(req);
+    await safeLog(req, {
+      category: 'pending deletion',
+      type: 'delete',
+      redirect_to: '/users/deletion-requests',
+      log_text: `Accepted deletion request and deleted user #${user.id} (${user.mobile || '-'})`,
+    });
+    await safeLog(req, {
+      category: 'users',
+      type: 'delete',
+      redirect_to: '/users',
+      log_text: `Deleted user (accepted pending deletion): #${user.id} (${user.mobile || '-'})`,
     });
 
-    res.json({ success: true, message: 'Associated data purged. User retained.' });
+    await deleteByUserId(userId, { deletedByAdminId: adminId ? Number(adminId) : undefined });
+    res.json({ success: true, message: 'User deleted' });
   } catch (error) {
     console.error('[users:delete-permanently] error', error);
-    res.status(500).json({ success: false, message: error.message });
+    const status = error?.status && Number.isFinite(error.status) ? error.status : 500;
+    res.status(status).json({ success: false, message: error.message });
   }
 });
 
@@ -291,10 +344,26 @@ router.get('/', async (req, res) => {
     const lastActiveSinceDays = parseInt(req.query.lastActiveSinceDays, 10);
     const search = (req.query.search || '').trim();
     const newFilter = (req.query.newFilter || '').toLowerCase();
+
+    // NEW: created_at date range filter (accept snake_case and camelCase)
+    const createdFromRaw = (req.query.created_from ?? req.query.createdFrom ?? '').toString().trim();
+    const createdToRaw = (req.query.created_to ?? req.query.createdTo ?? '').toString().trim();
+
+    // NEW: profile completion filter
+    const profileCompletedFilter = (req.query.profile_completed || '').toString().trim().toLowerCase();
+
     const where = {};
     if (userTypeFilter) where.user_type = userTypeFilter;
     if (statusFilter === 'active') where.is_active = true;
     if (statusFilter === 'inactive') where.is_active = false;
+
+    // NEW: apply profile completion filter
+    if (profileCompletedFilter === 'completed') {
+      where.profile_completed_at = { [Op.ne]: null };
+    } else if (profileCompletedFilter === 'not_completed') {
+      where.profile_completed_at = null;
+    }
+
     if (search) {
       const like = { [Op.like]: `%${search}%` };
       where[Op.or] = [
@@ -309,12 +378,44 @@ router.get('/', async (req, res) => {
       const threshold = new Date(Date.now() - lastActiveSinceDays * 24 * 60 * 60 * 1000);
       where.last_active_at = { [Op.gte]: threshold };
     }
+
+    const parseDateStartUtc = (value) => {
+      if (!value) return null;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+      const d = new Date(`${value}T00:00:00.000Z`);
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+    const parseDateEndUtc = (value) => {
+      if (!value) return null;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+      const d = new Date(`${value}T23:59:59.999Z`);
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+
+    const createdFromDate = parseDateStartUtc(createdFromRaw);
+    const createdToDate = parseDateEndUtc(createdToRaw);
+
+    let createdAtConstraints = where.created_at || null;
     if (newFilter === 'new') {
-      where.created_at = {
-        ...(where.created_at || {}),
-        [Op.gte]: new Date(Date.now() - NEW_USER_WINDOW_MS)
+      const threshold = new Date(Date.now() - NEW_USER_WINDOW_MS);
+      createdAtConstraints = { ...(createdAtConstraints || {}), [Op.gte]: threshold };
+    }
+    if (createdFromDate) {
+      const existing = createdAtConstraints?.[Op.gte];
+      createdAtConstraints = {
+        ...(createdAtConstraints || {}),
+        [Op.gte]: existing ? new Date(Math.max(existing.getTime(), createdFromDate.getTime())) : createdFromDate
       };
     }
+    if (createdToDate) {
+      const existing = createdAtConstraints?.[Op.lte];
+      createdAtConstraints = {
+        ...(createdAtConstraints || {}),
+        [Op.lte]: existing ? new Date(Math.min(existing.getTime(), createdToDate.getTime())) : createdToDate
+      };
+    }
+    if (createdAtConstraints) where.created_at = createdAtConstraints;
+
     const emptyMeta = {
       page: fetchAll ? 1 : page,
       limit: fetchAll ? 0 : limit,
@@ -344,7 +445,20 @@ router.get('/', async (req, res) => {
     const queryOptions = {
       where,
       order: [[sortField, sortDir]],
-      paranoid: true
+      paranoid: true,
+
+      // NEW: include StatusChangedBy (Admin) for "Status changed by" column in UI
+      include: [
+        {
+          model: Admin,
+          as: 'StatusChangedBy',
+          attributes: ['id', 'name'],
+          required: false
+        }
+      ],
+
+      // Safety when includes are present
+      distinct: true
     };
     if (!fetchAll) {
       queryOptions.limit = limit;
@@ -396,6 +510,11 @@ router.get('/', async (req, res) => {
 
       return {
         ...base,
+
+        // NEW: expose joined admin (name) for UI column
+        StatusChangedBy: base.StatusChangedBy ?? u.StatusChangedBy ?? null,
+
+        profile_completed_at: base.profile_completed_at ?? u.profile_completed_at ?? null,
         employee_id: linkedEmployee ? linkedEmployee.id : null,
         has_employee_profile: !!linkedEmployee,
         employer_id: linkedEmployer ? linkedEmployer.id : null,
@@ -500,17 +619,43 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const user = await User.findByPk(req.params.id);
+    const wasDeletePending = !!user.delete_pending;
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
     const payload = { ...req.body };
 
     if (payload.is_active !== undefined) payload.is_active = !!payload.is_active;
+    if (payload.delete_pending !== undefined) payload.delete_pending = !!payload.delete_pending;
     ['name','user_type','referral_code','referred_by'].forEach(f => {
       if (payload[f] === '') payload[f] = null;
     });
     // strip removed fields if sent by older clients
     delete payload.verification_status;
     delete payload.kyc_status;
+
+    // If activation status is being changed, stamp the admin who performed the change.
+    if (payload.is_active !== undefined || payload.deactivation_reason !== undefined) {
+      const adminId = getAdminId(req);
+      if (adminId) payload.status_change_by = adminId;
+    }
+
+
+    const requestedDeletePendingClear = payload.delete_pending === false;
+    const requestedDeleteRequestedAtClear = (
+      Object.prototype.hasOwnProperty.call(payload, 'delete_requested_at') && (payload.delete_requested_at === null || payload.delete_requested_at === '')
+    ) || (
+      Object.prototype.hasOwnProperty.call(payload, 'deletion_requested_at') && (payload.deletion_requested_at === null || payload.deletion_requested_at === '')
+    );
+
+    if (wasDeletePending && requestedDeletePendingClear && requestedDeleteRequestedAtClear) {
+      await safeLog(req, {
+        category: 'pending deletion',
+        type: 'update',
+        log_text: `Revoked deletion request for user #${user.id} (${user.mobile || '-'})`,
+        redirect_to: '/users/deletion-requests',
+      });
+    }
+
 
     await user.update(payload);
     res.json({ success: true, data: user });
@@ -531,16 +676,46 @@ router.patch('/:id/status', async (req, res) => {
     if (typeof is_active !== 'boolean') {
       return res.status(400).json({ success: false, message: 'is_active must be boolean' });
     }
+
+    const reason = (req.body?.deactivation_reason || '').toString().trim();
+    if (is_active === false && !reason) {
+      return res.status(400).json({ success: false, message: 'deactivation_reason is required when deactivating' });
+    }
+
     const user = await User.findByPk(req.params.id, { paranoid: false });
+    const previousIsActive = !!user?.is_active;
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
-    await user.update({ is_active });
+    const adminId = getAdminId(req);
+
+    // IMPORTANT: don't overwrite status_change_by with null when admin id isn't available
+    const updatePayload = {
+      is_active,
+      deactivation_reason: is_active ? null : reason,
+      ...(adminId ? { status_change_by: adminId } : {})
+    };
+
+    if (previousIsActive !== !!is_active) {
+      await safeLog(req, {
+        category: 'users',
+        type: 'update',
+        redirect_to: '/users',
+        log_text: is_active
+          ? `User activated: #${user.id} (${user.mobile || '-'})`
+          : `User deactivated: #${user.id} (${user.mobile || '-'})${reason ? ` (Reason: ${reason})` : ''}`,
+      });
+    }
+
+
+    await user.update(updatePayload);
+
     return res.json({ success: true, data: user });
   } catch (error) {
     console.error('[Users] status update error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Unable to update status' });
   }
 });
+
 
 /**
  * GET /users/:id/check
@@ -549,6 +724,7 @@ router.patch('/:id/status', async (req, res) => {
 router.get('/:id/check', async (req, res) => {
   try {
     const user = await User.findByPk(req.params.id, { paranoid: false });
+    const previousIsActive = !!user?.is_active;
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     res.json({ success: true, data: user });
   } catch (error) {
@@ -563,14 +739,26 @@ router.get('/:id/check', async (req, res) => {
  */
 router.delete('/:id', async (req, res) => {
   try {
-    const user = await User.findByPk(req.params.id, { paranoid: false });
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    const userId = Number(req.params.id);
+    const user = Number.isFinite(userId) ? await User.findByPk(userId, { paranoid: false }) : null;
 
-    await markUserAsDeleted(user);
+    const adminId = getAdminId(req);
+    await deleteByUserId(req.params.id, { deletedByAdminId: adminId ? Number(adminId) : undefined });
+
+    if (user) {
+      await safeLog(req, {
+        category: 'users',
+        type: 'delete',
+        redirect_to: '/users',
+        log_text: `User deleted: #${user.id} (${user.mobile || '-'})`,
+      });
+    }
+
     return res.json({ success: true, message: 'User deleted' });
   } catch (error) {
     console.error('[Users] delete error:', error);
-    return res.status(500).json({ success: false, message: error.message || 'Delete failed' });
+    const status = error?.status && Number.isFinite(error.status) ? error.status : 500;
+    return res.status(status).json({ success: false, message: error.message || 'Delete failed' });
   }
 });
 

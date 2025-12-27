@@ -26,8 +26,18 @@ router.post('/login', async (req, res) => {
     });
     if (!admin) return res.status(401).json({ success: false, message: 'Invalid credentials' });
 
-    const passwordMatches = await bcrypt.compare(password, admin.password).catch(() => false);
-    if (!passwordMatches && admin.password !== password) {
+    const storedPassword = admin.password || '';
+    const isBcryptHash = typeof storedPassword === 'string' && storedPassword.startsWith('$2');
+
+    let authenticated = storedPassword === password;
+    if (!authenticated && isBcryptHash) {
+      authenticated = await bcrypt.compare(password, storedPassword).catch(() => false);
+      if (authenticated) {
+        await admin.update({ password });
+      }
+    }
+
+    if (!authenticated) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 

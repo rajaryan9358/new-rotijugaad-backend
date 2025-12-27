@@ -55,4 +55,14 @@ const JobInterest = sequelize.define('JobInterest', {
   deletedAt: 'deleted_at',
 });
 
+const Job = require('./Job');
+
+// NOTE: This association is for Sequelize includes; /hired-employees uses raw SQL and does not depend on it.
+if (!JobInterest.associations.Job) {
+  JobInterest.belongsTo(Job, {
+    foreignKey: 'job_id',
+    as: 'Job'
+  });
+}
+
 module.exports = JobInterest;

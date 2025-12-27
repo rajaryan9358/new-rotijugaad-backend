@@ -1,30 +1,71 @@
 const express = require('express');
 const router = express.Router();
-const { Employee, State, City, Qualification, Shift, EmployeeSubscriptionPlan, User, EmployeeJobProfile, JobProfile } = require('../models');
+const {
+  Employee,
+  State,
+  City,
+  Qualification,
+  Shift,
+  EmployeeSubscriptionPlan,
+  User,
+  EmployeeJobProfile,
+  JobProfile,
+  Job,
+  Employer,
+  JobGender,
+  JobExperience,
+  Experience,
+  JobQualification,
+  JobShift,
+  JobSkill,
+  Skill,
+  SelectedJobBenefit,
+  JobBenefit
+} = require('../models');
 const EmployeeExperience = require('../models/EmployeeExperience');
+const WorkNature = require('../models/WorkNature');
 const EmployeeDocument = require('../models/EmployeeDocument'); // ensure present
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const JobInterest = require('../models/JobInterest');
-const Job = require('../models/Job');
-const Employer = require('../models/Employer');
 const Wishlist = require('../models/Wishlist'); // add this line if not present
 const EmployeeContact = require('../models/EmployeeContact'); // add if not present
 const CallHistory = require('../models/CallHistory'); // add if not present
 const EmployeeCallExperience = require('../models/EmployeeCallExperience'); // add if not present
 const EmployerCallExperience = require('../models/EmployerCallExperience'); // new for mixed history lookups
-const markUserAsDeleted = require('../utils/markUserAsDeleted');
+const { deleteByEmployeeId } = require('../utils/deleteUserTransactional');
 const Sequelize = require('sequelize');
 const { Op, fn, col } = Sequelize;
 const Referral = require('../models/Referral'); // added
 const { sequelize } = require('../config/db'); // added
+const Volunteer = require('../models/Volunteer'); // NEW: for assistant_code -> volunteer mapping
+const EmployerReportReason = require('../models/EmployerReportReason'); // NEW (job report reasons)
+const Report = require('../models/Report'); // NEW
+const getAdminId = require('../utils/getAdminId');
+const Admin = require('../models/Admin'); // NEW: join status_change_by -> admins.name
+const Log = require('../models/Log');
+
+const { authenticate } = require('../middleware/auth');
 
 // Add: normalize date helper
 const normalizeDateOrNull = (value) => {
   if (!value) return null;
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
+};
+// NEW: treat date-only bounds as start-of-day and end-exclusive (next day start)
+const startOfDay = (d) => {
+  if (!d) return null;
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+};
+const endExclusiveOfDay = (d) => {
+  if (!d) return null;
+  const x = startOfDay(d);
+  x.setDate(x.getDate() + 1);
+  return x;
 };
 // Add: normalize integer helper
 const normalizeIntOrNull = (value) => {
@@ -34,6 +75,62 @@ const normalizeIntOrNull = (value) => {
 };
 
 
+const normalizeDecimalOrNull = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+const safeCreateLog = async (payload) => {
+  try {
+    await Log.create(payload);
+  } catch (error) {
+    console.error('[logs] failed to create log', error);
+  }
+};
+
+const safeLog = async (req, { category, type, redirect_to, log_text }) => {
+  return safeCreateLog({
+    category,
+    type,
+    redirect_to: redirect_to || null,
+    log_text: log_text || null,
+    rj_employee_id: getAdminId(req),
+  });
+};
+
+const pickEmployeePayload = (body = {}) => ({
+  name: (body.name ?? null) === '' ? null : body.name,
+  dob: body.dob || null,
+  gender: body.gender || null,
+  state_id: normalizeIntOrNull(body.state_id),
+  city_id: normalizeIntOrNull(body.city_id),
+  preferred_state_id: normalizeIntOrNull(body.preferred_state_id),
+  preferred_city_id: normalizeIntOrNull(body.preferred_city_id),
+  qualification_id: normalizeIntOrNull(body.qualification_id),
+  expected_salary: normalizeDecimalOrNull(body.expected_salary),
+  expected_salary_frequency: body.expected_salary_frequency || null,
+  preferred_shift_id: normalizeIntOrNull(body.preferred_shift_id),
+  assistant_code: body.assistant_code || null,
+  email: body.email || null,
+  about_user: body.about_user || null,
+  aadhar_number: body.aadhar_number || null,
+  aadhar_verified_at: body.aadhar_verified_at || null,
+  selfie_link: body.selfie_link || null,
+  verification_status: body.verification_status || undefined,
+  verification_at: body.verification_at || undefined,
+  kyc_status: body.kyc_status || undefined,
+  kyc_verification_at: body.kyc_verification_at || undefined,
+  total_contact_credit: normalizeIntOrNull(body.total_contact_credit) ?? undefined,
+  contact_credit: normalizeIntOrNull(body.contact_credit) ?? undefined,
+  total_interest_credit: normalizeDecimalOrNull(body.total_interest_credit) ?? undefined,
+  interest_credit: normalizeDecimalOrNull(body.interest_credit) ?? undefined,
+  credit_expiry_at: body.credit_expiry_at || undefined,
+  subscription_plan_id: normalizeIntOrNull(body.subscription_plan_id),
+});
+
+const employeeRedirect = (id) => `/employees/${id}`;
+
 const baseInclude = [
   { model: State, as: 'State' },
   { model: City, as: 'City' },
@@ -42,17 +139,821 @@ const baseInclude = [
   { model: Qualification, as: 'Qualification' },
   { model: Shift, as: 'Shift' },
   { model: EmployeeSubscriptionPlan, as: 'SubscriptionPlan' },
-  { model: User, as: 'User', attributes: ['id', 'is_active', 'last_active_at', 'created_at'], paranoid: false }
+  {
+    model: User,
+    as: 'User',
+    attributes: [
+      'id',
+      'name',
+      'mobile',
+      'is_active',
+      'deactivation_reason',
+      'status_change_by', // NEW
+      'last_active_at',
+      'profile_completed_at',
+      'created_at'
+    ],
+    include: [
+      {
+        model: Admin,
+        as: 'StatusChangedBy', // must match User.belongsTo(... as)
+        attributes: ['id', 'name'],
+        required: false
+      }
+    ],
+    paranoid: false
+  }
 ];
 
 const ensureUserInclude = (includeList = []) => {
   let userInclude = includeList.find(item => item.as === 'User');
   if (!userInclude) {
-    userInclude = { model: User, as: 'User', attributes: ['id', 'is_active', 'last_active_at', 'created_at'], paranoid: false };
+    userInclude = {
+      model: User,
+      as: 'User',
+      attributes: [
+        'id',
+        'name',
+        'mobile',
+        'is_active',
+        'deactivation_reason',
+        'status_change_by', // NEW
+        'last_active_at',
+        'profile_completed_at',
+        'created_at'
+      ],
+      include: [
+        {
+          model: Admin,
+          as: 'StatusChangedBy',
+          attributes: ['id', 'name'],
+          required: false
+        }
+      ],
+      paranoid: false
+    };
     includeList.push(userInclude);
   }
   return userInclude;
 };
+
+
+/**
+ * GET /employees
+ * List employees.
+ */
+router.get('/', async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const pageSizeRaw = req.query.pageSize ?? req.query.limit;
+    const pageSizeNum = parseInt(pageSizeRaw, 10);
+    const pageSize = Math.min(Math.max(pageSizeNum || 25, 1), 500);
+    const offset = (page - 1) * pageSize;
+
+    const sortFieldRaw = (req.query.sortField || 'id').toString();
+    const sortDir = (req.query.sortDir || 'asc').toString().toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
+    const where = {};
+
+    // filters
+    const search = (req.query.search || '').toString().trim();
+    const stateFilter = normalizeIntOrNull(req.query.stateFilter);
+    const cityFilter = normalizeIntOrNull(req.query.cityFilter);
+    const prefStateFilter = normalizeIntOrNull(req.query.prefStateFilter);
+    const prefCityFilter = normalizeIntOrNull(req.query.prefCityFilter);
+    const qualificationFilter = normalizeIntOrNull(req.query.qualificationFilter);
+    const shiftFilter = normalizeIntOrNull(req.query.shiftFilter);
+    const planFilter = normalizeIntOrNull(req.query.planFilter);
+
+    const salaryFreqFilter = (req.query.salaryFreqFilter || '').toString().trim();
+    const genderFilter = (req.query.genderFilter || '').toString().trim();
+    const verificationFilter = (req.query.verificationFilter || '').toString().trim();
+    const kycFilter = (req.query.kycFilter || '').toString().trim();
+    const subscriptionStatusFilter = (req.query.subscriptionStatusFilter || '').toString().trim().toLowerCase();
+    const statusFilter = (req.query.status || '').toString().trim().toLowerCase();
+    const newFilter = (req.query.newFilter || '').toString().trim().toLowerCase();
+
+    const jobProfileFilter = normalizeIntOrNull(req.query.jobProfileFilter);
+    const workNatureFilter = normalizeIntOrNull(req.query.workNatureFilter);
+    const workDurationFilter = (req.query.workDurationFilter || '').toString().trim();
+    const workDurationFreqFilter = (req.query.workDurationFreqFilter || '').toString().trim();
+    const assistantCode = (req.query.assistantCode || '').toString().trim();
+
+    const createdFrom = normalizeDateOrNull(req.query.createdFrom || req.query.created_from);
+    const createdTo = normalizeDateOrNull(req.query.createdTo || req.query.created_to);
+
+    const kycVerifiedFrom = normalizeDateOrNull(req.query.kyc_verified_from);
+    const kycVerifiedTo = normalizeDateOrNull(req.query.kyc_verified_to);
+
+    if (stateFilter) where.state_id = stateFilter;
+    if (cityFilter) where.city_id = cityFilter;
+    if (prefStateFilter) where.preferred_state_id = prefStateFilter;
+    if (prefCityFilter) where.preferred_city_id = prefCityFilter;
+    if (qualificationFilter) where.qualification_id = qualificationFilter;
+    if (shiftFilter) where.preferred_shift_id = shiftFilter;
+    if (planFilter) where.subscription_plan_id = planFilter;
+    if (salaryFreqFilter) where.expected_salary_frequency = salaryFreqFilter;
+    if (genderFilter) where.gender = genderFilter;
+    if (verificationFilter) where.verification_status = verificationFilter;
+    if (kycFilter) where.kyc_status = kycFilter;
+    if (assistantCode) where.assistant_code = assistantCode;
+
+    if (createdFrom) {
+      where.created_at = { ...(where.created_at || {}), [Op.gte]: startOfDay(createdFrom) };
+    }
+    if (createdTo) {
+      where.created_at = { ...(where.created_at || {}), [Op.lt]: endExclusiveOfDay(createdTo) };
+    }
+
+    if (kycVerifiedFrom) {
+      where.kyc_verification_at = { ...(where.kyc_verification_at || {}), [Op.gte]: startOfDay(kycVerifiedFrom) };
+    }
+    if (kycVerifiedTo) {
+      where.kyc_verification_at = { ...(where.kyc_verification_at || {}), [Op.lt]: endExclusiveOfDay(kycVerifiedTo) };
+    }
+
+    if (subscriptionStatusFilter === 'active') {
+      where.credit_expiry_at = { [Op.gte]: new Date() };
+    } else if (subscriptionStatusFilter === 'expired') {
+      where.credit_expiry_at = { [Op.lt]: new Date() };
+    }
+
+    if (search) {
+      const like = { [Op.like]: `%${search}%` };
+      const numeric = parseInt(search, 10);
+      const or = [
+        { name: like },
+        { email: like },
+        { assistant_code: like },
+        Sequelize.where(Sequelize.col('User.mobile'), like)
+      ];
+      if (!Number.isNaN(numeric)) or.push({ id: numeric });
+      where[Op.or] = or;
+    }
+
+    const include = [...baseInclude];
+
+    // User filters (active/inactive + new)
+    const userInclude = ensureUserInclude(include);
+    const userWhere = {};
+    if (statusFilter === 'active') userWhere.is_active = true;
+    if (statusFilter === 'inactive') userWhere.is_active = false;
+    if (newFilter === 'new') {
+      userWhere.created_at = { [Op.gte]: new Date(Date.now() - 48 * 60 * 60 * 1000) };
+    }
+    if (Object.keys(userWhere).length) {
+      userInclude.where = userWhere;
+      userInclude.required = true;
+    }
+
+    // job profile filter via join table
+    if (jobProfileFilter) {
+      include.push({
+        model: EmployeeJobProfile,
+        as: 'EmployeeJobProfiles',
+        attributes: ['employee_id', 'job_profile_id'],
+        where: { job_profile_id: jobProfileFilter },
+        required: true,
+        paranoid: true
+      });
+    }
+
+    // work nature filter via experiences
+    if (workNatureFilter || workDurationFilter || workDurationFreqFilter) {
+      const expWhere = {};
+      if (workNatureFilter) expWhere.work_nature_id = workNatureFilter;
+      if (workDurationFilter) expWhere.work_duration = workDurationFilter;
+      if (workDurationFreqFilter) expWhere.work_duration_frequency = workDurationFreqFilter;
+
+      const expRows = await EmployeeExperience.findAll({
+        attributes: ['user_id'],
+        where: expWhere,
+        paranoid: true
+      });
+      const employeeIds = [...new Set(expRows.map(r => r.user_id).filter(Boolean))];
+      if (!employeeIds.length) {
+        return res.json({ success: true, data: [], meta: { page, pageSize, total: 0, totalPages: 1 } });
+      }
+      where.id = { ...(where.id || {}), [Op.in]: employeeIds };
+    }
+
+    const SORTABLE = new Set([
+      'id',
+      'name',
+      'email',
+      'assistant_code',
+      'dob',
+      'gender',
+      'expected_salary',
+      'verification_status',
+      'kyc_status',
+      'created_at',
+      'credit_expiry_at',
+      'is_active',
+      'state',
+      'city',
+      'qualification',
+      'shift'
+    ]);
+
+    const sortField = SORTABLE.has(sortFieldRaw) ? sortFieldRaw : 'id';
+
+    const order = (() => {
+      if (sortField === 'is_active') return [[{ model: User, as: 'User' }, 'is_active', sortDir], ['id', 'ASC']];
+      if (sortField === 'state') return [[{ model: State, as: 'State' }, 'state_english', sortDir], ['id', 'ASC']];
+      if (sortField === 'city') return [[{ model: City, as: 'City' }, 'city_english', sortDir], ['id', 'ASC']];
+      if (sortField === 'qualification') return [[{ model: Qualification, as: 'Qualification' }, 'qualification_english', sortDir], ['id', 'ASC']];
+      if (sortField === 'shift') return [[{ model: Shift, as: 'Shift' }, 'shift_english', sortDir], ['id', 'ASC']];
+      return [[sortField, sortDir], ['id', 'ASC']];
+    })();
+
+    const result = await Employee.findAndCountAll({
+      where,
+      include,
+      order,
+      offset,
+      limit: pageSize,
+      distinct: true,
+      paranoid: true
+    });
+
+    const rows = result.rows || [];
+
+    // Build job_profiles_display + work_natures_display for list UI.
+    const employeeIds = rows.map(r => r.id).filter(Boolean);
+    const jobProfilesMap = new Map();
+    const workNaturesMap = new Map();
+
+    if (employeeIds.length) {
+      const jpRows = await EmployeeJobProfile.findAll({
+        where: { employee_id: employeeIds },
+        include: [{ model: JobProfile, as: 'JobProfile', attributes: ['id', 'profile_english'], required: false }],
+        paranoid: true
+      });
+      for (const r of jpRows) {
+        const list = jobProfilesMap.get(r.employee_id) || [];
+        const label = r.JobProfile?.profile_english;
+        if (label) list.push(label);
+        jobProfilesMap.set(r.employee_id, list);
+      }
+
+      const expRows = await EmployeeExperience.findAll({
+        where: { user_id: employeeIds },
+        include: [{ model: WorkNature, as: 'WorkNature', attributes: ['id', 'nature_english'], required: false }],
+        paranoid: true
+      });
+      for (const r of expRows) {
+        const list = workNaturesMap.get(r.user_id) || [];
+        const label = r.WorkNature?.nature_english;
+        if (label) list.push(label);
+        workNaturesMap.set(r.user_id, list);
+      }
+    }
+
+    const data = rows.map((emp) => {
+      const json = emp.toJSON();
+      const jp = jobProfilesMap.get(emp.id) || [];
+      const wn = workNaturesMap.get(emp.id) || [];
+      return {
+        ...json,
+        job_profiles_display: jp.length ? [...new Set(jp)].join(', ') : null,
+        work_natures_display: wn.length ? [...new Set(wn)].join(', ') : null
+      };
+    });
+
+    const total = result.count || 0;
+    const totalPages = Math.max(Math.ceil(total / pageSize) || 1, 1);
+
+    res.json({ success: true, data, meta: { page, pageSize, total, totalPages } });
+  } catch (error) {
+    console.error('[employees] list error:', error);
+    res.status(500).json({ success: false, message: error.message || 'Failed to fetch employees' });
+  }
+});
+
+/**
+ * GET /employees/:id
+ * Fetch single employee.
+ */
+router.get('/:id', async (req, res) => {
+  try {
+    const employeeId = parseInt(req.params.id, 10);
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
+
+    const include = [...baseInclude];
+    const employee = await Employee.findByPk(employeeId, { include, paranoid: true });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    // Add display helpers.
+    const jpRows = await EmployeeJobProfile.findAll({
+      where: { employee_id: employeeId },
+      include: [{ model: JobProfile, as: 'JobProfile', attributes: ['id', 'profile_english'], required: false }],
+      paranoid: true
+    });
+    const jobProfiles = jpRows.map(r => r.JobProfile?.profile_english).filter(Boolean);
+
+    const expRows = await EmployeeExperience.findAll({
+      where: { user_id: employeeId },
+      include: [{ model: WorkNature, as: 'WorkNature', attributes: ['id', 'nature_english'], required: false }],
+      paranoid: true
+    });
+    const workNatures = expRows.map(r => r.WorkNature?.nature_english).filter(Boolean);
+
+    const data = {
+      ...employee.toJSON(),
+      job_profiles_display: jobProfiles.length ? [...new Set(jobProfiles)].join(', ') : null,
+      work_natures_display: workNatures.length ? [...new Set(workNatures)].join(', ') : null
+    };
+
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('[employees] getById error:', error);
+    res.status(500).json({ success: false, message: error.message || 'Failed to fetch employee' });
+  }
+});
+
+/**
+ * POST /employees
+ * Create an employee (and user if user_id not provided).
+ * Performs User+Employee writes in a single transaction.
+ */
+router.post('/', authenticate, async (req, res) => {
+  try {
+    const rawUserId = req.body?.user_id;
+    const userId = rawUserId ? Number(rawUserId) : null;
+    const name = (req.body?.name || '').toString().trim();
+    const mobile = (req.body?.mobile || '').toString().trim();
+
+    if (!name) return res.status(400).json({ success: false, message: 'Name is required' });
+
+    let createdEmployee = null;
+    let createdUser = null;
+
+    await sequelize.transaction(async (t) => {
+      let user;
+      if (userId) {
+        user = await User.findByPk(userId, { transaction: t, paranoid: false });
+        if (!user) {
+          const err = new Error('User not found');
+          err.status = 404;
+          throw err;
+        }
+        const existing = await Employee.findOne({ where: { user_id: user.id }, transaction: t, paranoid: false });
+        if (existing) {
+          const err = new Error('Employee record already exists for this user');
+          err.status = 400;
+          throw err;
+        }
+        const userUpdates = {};
+        if (mobile && mobile !== user.mobile) userUpdates.mobile = mobile;
+        if (name && (!user.name || !user.name.toString().trim())) userUpdates.name = name;
+        if (!user.user_type) userUpdates.user_type = 'employee';
+        if (Object.keys(userUpdates).length) await user.update(userUpdates, { transaction: t });
+      } else {
+        if (!mobile) {
+          const err = new Error('Mobile is required');
+          err.status = 400;
+          throw err;
+        }
+        user = await User.create({ mobile, name, user_type: 'employee' }, { transaction: t });
+        createdUser = user;
+      }
+
+      const empPayload = pickEmployeePayload(req.body);
+      empPayload.name = name;
+
+      createdEmployee = await Employee.create({
+        ...empPayload,
+        user_id: user.id,
+      }, { transaction: t });
+    });
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'add',
+      redirect_to: employeeRedirect(createdEmployee.id),
+      log_text: `Employee created: #${createdEmployee.id} ${name}${mobile ? ` (${mobile})` : ''}`,
+    });
+
+    return res.status(201).json({ success: true, data: createdEmployee, meta: { user: createdUser ? { id: createdUser.id } : null } });
+  } catch (error) {
+    const status = error?.status && Number.isFinite(error.status) ? error.status : 500;
+    console.error('[employees:create] error', error);
+    return res.status(status).json({ success: false, message: error.message || 'Failed to create employee' });
+  }
+});
+
+/**
+ * PUT /employees/:id
+ * Update an employee (and optionally update linked user mobile/name).
+ */
+router.put('/:id', authenticate, async (req, res) => {
+  try {
+    const employeeId = Number(req.params.id);
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
+
+    let updatedEmployee;
+    let beforeName;
+    await sequelize.transaction(async (t) => {
+      const employee = await Employee.findByPk(employeeId, { transaction: t, paranoid: false });
+      if (!employee) {
+        const err = new Error('Employee not found');
+        err.status = 404;
+        throw err;
+      }
+
+      beforeName = employee.name;
+      const empPayload = pickEmployeePayload(req.body);
+      if (typeof req.body?.name === 'string' && req.body.name.trim()) empPayload.name = req.body.name.trim();
+      await employee.update(empPayload, { transaction: t });
+
+      const mobile = (req.body?.mobile || '').toString().trim();
+      const name = (req.body?.name || '').toString().trim();
+      const user = await User.findByPk(employee.user_id, { transaction: t, paranoid: false });
+      if (user) {
+        const userUpdates = {};
+        if (mobile && mobile !== user.mobile) userUpdates.mobile = mobile;
+        if (name && name !== user.name) userUpdates.name = name;
+        if (Object.keys(userUpdates).length) await user.update(userUpdates, { transaction: t });
+      }
+
+      updatedEmployee = employee;
+    });
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(updatedEmployee.id),
+      log_text: `Employee updated: #${updatedEmployee.id} ${beforeName || '-'} → ${updatedEmployee.name || '-'}`,
+    });
+
+    return res.json({ success: true, data: updatedEmployee });
+  } catch (error) {
+    const status = error?.status && Number.isFinite(error.status) ? error.status : 500;
+    console.error('[employees:update] error', error);
+    return res.status(status).json({ success: false, message: error.message || 'Failed to update employee' });
+  }
+});
+
+const handleEmployeeStatusMutation = async (req, res, field, value, message) => {
+  try {
+    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    const payload = { [field]: value };
+    if (field === 'verification_status') {
+      payload.verification_at = (value === 'verified' || value === 'rejected') ? new Date() : null;
+    }
+    if (field === 'kyc_status') {
+      payload.kyc_verification_at = (value === 'verified' || value === 'rejected') ? new Date() : null;
+    }
+
+    await employee.update(payload);
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(employee.id),
+      log_text: `Employee ${field} set to ${value}: #${employee.id} ${employee.name || '-'}`,
+    });
+
+    return res.json({ success: true, message });
+  } catch (error) {
+    console.error(`[employees:${field}] error`, error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+router.post('/:id/approve', authenticate, (req, res) =>
+  handleEmployeeStatusMutation(req, res, 'verification_status', 'verified', 'Verification marked as verified')
+);
+router.post('/:id/reject', authenticate, (req, res) =>
+  handleEmployeeStatusMutation(req, res, 'verification_status', 'rejected', 'Verification rejected')
+);
+router.post('/:id/kyc/grant', authenticate, (req, res) =>
+  handleEmployeeStatusMutation(req, res, 'kyc_status', 'verified', 'KYC marked as verified')
+);
+router.post('/:id/kyc/reject', authenticate, (req, res) =>
+  handleEmployeeStatusMutation(req, res, 'kyc_status', 'rejected', 'KYC rejected')
+);
+
+router.post('/:id/change-subscription', authenticate, async (req, res) => {
+  try {
+    const { subscription_plan_id } = req.body || {};
+    if (!subscription_plan_id) return res.status(400).json({ success: false, message: 'subscription_plan_id is required' });
+
+    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    const plan = await EmployeeSubscriptionPlan.findByPk(subscription_plan_id);
+    if (!plan) return res.status(404).json({ success: false, message: 'Plan not found' });
+
+    const validityDays = Number(plan.plan_validity_days) || 0;
+    const expiryAt = validityDays ? new Date(Date.now() + validityDays * 24 * 60 * 60 * 1000) : null;
+
+    await employee.update({
+      subscription_plan_id: plan.id,
+      total_contact_credit: Number(plan.contact_credits) || 0,
+      total_interest_credit: Number(plan.interest_credits) || 0,
+      contact_credit: 0,
+      interest_credit: 0,
+      credit_expiry_at: expiryAt,
+    });
+
+    await safeLog(req, {
+      category: 'employee subscription',
+      type: 'update',
+      redirect_to: employeeRedirect(employee.id),
+      log_text: `Employee subscription changed: #${employee.id} plan_id=${plan.id}, expiry=${expiryAt ? expiryAt.toISOString() : '-'}`,
+    });
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(employee.id),
+      log_text: `Employee subscription changed (employee log): #${employee.id} plan_id=${plan.id}`,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Subscription updated',
+      data: {
+        subscription_plan_id: plan.id,
+        credit_expiry_at: expiryAt,
+        total_contact_credit: employee.total_contact_credit,
+        total_interest_credit: employee.total_interest_credit,
+      },
+    });
+  } catch (error) {
+    console.error('[employees:change-subscription] error', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.post('/:id/add-credits', authenticate, async (req, res) => {
+  try {
+    const contactDelta = Number(req.body?.contact_credits) || 0;
+    const interestDelta = Number(req.body?.interest_credits) || 0;
+    if (contactDelta <= 0 && interestDelta <= 0) return res.status(400).json({ success: false, message: 'Provide credits to add' });
+
+    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    const updatePayload = {
+      total_contact_credit: Number(employee.total_contact_credit || 0) + Math.max(contactDelta, 0),
+      total_interest_credit: Number(employee.total_interest_credit || 0) + Math.max(interestDelta, 0),
+    };
+    if (req.body?.credit_expiry_at) updatePayload.credit_expiry_at = req.body.credit_expiry_at;
+
+    await employee.update(updatePayload);
+
+    await safeLog(req, {
+      category: 'employee subscription',
+      type: 'update',
+      redirect_to: employeeRedirect(employee.id),
+      log_text: `Employee credits added: #${employee.id} +${Math.max(contactDelta, 0)} contact, +${Math.max(interestDelta, 0)} interest`,
+    });
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(employee.id),
+      log_text: `Employee credits updated (employee log): #${employee.id} +${Math.max(contactDelta, 0)} contact, +${Math.max(interestDelta, 0)} interest`,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Credits updated',
+      data: {
+        total_contact_credit: employee.total_contact_credit,
+        total_interest_credit: employee.total_interest_credit,
+        credit_expiry_at: employee.credit_expiry_at,
+      },
+    });
+  } catch (error) {
+    console.error('[employees:add-credits] error', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+
+
+/**
+ * GET /employees/:id/recommended-jobs
+ * Jobs recommended for an employee based on:
+ * - Preferred state/city matching (if present)
+ * - Gender matching (job gender 'any' matches all)
+ * - Expected salary within job salary_min/salary_max (if employee expected salary present)
+ * - Job profile matches any of employee's selected job profiles
+ */
+router.get('/:id/recommended-jobs', authenticate, async (req, res) => {
+  try {
+    const employeeId = parseInt(req.params.id, 10);
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
+
+    const employee = await Employee.findByPk(employeeId, {
+      attributes: ['id', 'gender', 'expected_salary', 'preferred_state_id', 'preferred_city_id'],
+      paranoid: true
+    });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    const profileRows = await EmployeeJobProfile.findAll({
+      where: { employee_id: employeeId },
+      attributes: ['job_profile_id'],
+      paranoid: true
+    });
+    const jobProfileIds = profileRows.map(r => r.job_profile_id).filter(Boolean);
+    if (!jobProfileIds.length) return res.json({ success: true, data: [] });
+
+    const expectedSalary = employee.expected_salary === null || employee.expected_salary === undefined || employee.expected_salary === ''
+      ? null
+      : Number(employee.expected_salary);
+
+    const where = {
+      job_profile_id: { [Op.in]: jobProfileIds }
+    };
+
+    if (employee.preferred_state_id) where.job_state_id = employee.preferred_state_id;
+    if (employee.preferred_city_id) where.job_city_id = employee.preferred_city_id;
+
+    const and = [];
+
+    // Include only active + expired (exclude inactive).
+    // Expired means: status='expired' OR expired_at is non-null.
+    and.push({
+      [Op.or]: [
+        { status: 'active', expired_at: { [Op.is]: null } },
+        { [Op.or]: [{ status: 'expired' }, { expired_at: { [Op.not]: null } }] }
+      ]
+    });
+
+    if (Number.isFinite(expectedSalary)) {
+      and.push(Sequelize.literal(`(Job.salary_min IS NULL OR Job.salary_min <= ${sequelize.escape(expectedSalary)})`));
+      and.push(Sequelize.literal(`(Job.salary_max IS NULL OR Job.salary_max >= ${sequelize.escape(expectedSalary)})`));
+    }
+
+    const gender = (employee.gender || '').toString().trim().toLowerCase();
+    if (gender) {
+      and.push(Sequelize.literal(`(
+        NOT EXISTS (SELECT 1 FROM job_genders jg WHERE jg.job_id = Job.id)
+        OR EXISTS (SELECT 1 FROM job_genders jg WHERE jg.job_id = Job.id AND LOWER(jg.gender) = 'any')
+        OR EXISTS (SELECT 1 FROM job_genders jg WHERE jg.job_id = Job.id AND LOWER(jg.gender) = ${sequelize.escape(gender)})
+      )`));
+    }
+
+    where[Op.and] = and;
+
+    const jobs = await Job.findAll({
+      where,
+      attributes: [
+        'id',
+        'employer_id',
+        'job_profile_id',
+        'is_household',
+        'interviewer_contact',
+        'work_start_time',
+        'work_end_time',
+        'salary_min',
+        'salary_max',
+        'no_vacancy',
+        'hired_total',
+        'status',
+        'verification_status',
+        'job_state_id',
+        'job_city_id',
+        'created_at',
+        'expired_at'
+      ],
+      include: [
+        {
+          model: Employer,
+          as: 'Employer',
+          attributes: ['id', 'name', 'organization_name', 'organization_type'],
+          required: false,
+          paranoid: false,
+          include: [{ model: User, as: 'User', attributes: ['mobile'], required: false, paranoid: false }]
+        },
+        { model: JobProfile, as: 'JobProfile', attributes: ['id', 'profile_english'], required: false },
+        { model: JobGender, as: 'JobGenders', attributes: ['gender'], required: false },
+        {
+          model: JobExperience,
+          as: 'JobExperiences',
+          attributes: ['experience_id'],
+          required: false,
+          include: [{ model: Experience, as: 'Experience', attributes: ['title_english'], required: false }]
+        },
+        {
+          model: JobQualification,
+          as: 'JobQualifications',
+          attributes: ['qualification_id'],
+          required: false,
+          include: [{ model: Qualification, as: 'Qualification', attributes: ['qualification_english'], required: false }]
+        },
+        {
+          model: JobShift,
+          as: 'JobShifts',
+          attributes: ['shift_id'],
+          required: false,
+          include: [{ model: Shift, as: 'Shift', attributes: ['shift_english'], required: false }]
+        },
+        {
+          model: JobSkill,
+          as: 'JobSkills',
+          attributes: ['skill_id'],
+          required: false,
+          include: [{ model: Skill, as: 'Skill', attributes: ['skill_english'], required: false }]
+        },
+        {
+          model: SelectedJobBenefit,
+          as: 'SelectedJobBenefits',
+          attributes: ['benefit_id'],
+          required: false,
+          include: [{ model: JobBenefit, as: 'JobBenefit', attributes: ['benefit_english'], required: false }]
+        },
+        { model: State, as: 'JobState', attributes: ['state_english'], required: false },
+        { model: City, as: 'JobCity', attributes: ['city_english'], required: false }
+      ],
+      order: [['created_at', 'DESC']],
+      limit: 200
+    });
+
+    const formatTime12h = (timeStr) => {
+      if (!timeStr) return null;
+      const s = String(timeStr);
+      const parts = s.split(':');
+      if (parts.length < 2) return s;
+      let h = parseInt(parts[0], 10);
+      const m = parts[1];
+      if (Number.isNaN(h)) return s;
+      const suffix = h >= 12 ? 'PM' : 'AM';
+      h = h % 12 || 12;
+      return `${h}:${m} ${suffix}`;
+    };
+
+    const shiftTimingDisplay = (start, end) => {
+      const a = formatTime12h(start);
+      const b = formatTime12h(end);
+      if (!a && !b) return null;
+      if (a && b) return `${a} - ${b}`;
+      return a || b;
+    };
+
+    const jobLife = (createdAt) => {
+      if (!createdAt) return null;
+      const d = new Date(createdAt);
+      if (Number.isNaN(d.getTime())) return null;
+      const ms = Date.now() - d.getTime();
+      const days = Math.max(Math.floor(ms / 86400000), 0);
+      return `${days} ${days === 1 ? 'day' : 'days'}`;
+    };
+
+    const data = jobs.map((job) => {
+      const employer = job.Employer || null;
+      const employerPhone = employer?.User?.mobile || null;
+
+      const genders = (job.JobGenders || []).map(g => g.gender).filter(Boolean);
+      const experiences = (job.JobExperiences || []).map(x => x.Experience?.title_english).filter(Boolean);
+      const qualifications = (job.JobQualifications || []).map(x => x.Qualification?.qualification_english).filter(Boolean);
+      const shifts = (job.JobShifts || []).map(x => x.Shift?.shift_english).filter(Boolean);
+      const skills = (job.JobSkills || []).map(x => x.Skill?.skill_english).filter(Boolean);
+      const benefits = (job.SelectedJobBenefits || []).map(x => x.JobBenefit?.benefit_english).filter(Boolean);
+
+      return {
+        job_id: job.id,
+        employer_id: job.employer_id,
+        employer_name: employer?.name || null,
+        organization_name: employer?.organization_name || null,
+        organization_type: employer?.organization_type || null,
+        employer_phone: employerPhone,
+        interviewer_contact: job.interviewer_contact || null,
+        job_profile_id: job.job_profile_id || null,
+        job_profile: job.JobProfile?.profile_english || null,
+        shift_timing_display: shiftTimingDisplay(job.work_start_time, job.work_end_time),
+        is_household: !!job.is_household,
+        genders: genders.length ? Array.from(new Set(genders)).join(', ') : null,
+        experiences: experiences.length ? Array.from(new Set(experiences)).join(', ') : null,
+        qualifications: qualifications.length ? Array.from(new Set(qualifications)).join(', ') : null,
+        shifts: shifts.length ? Array.from(new Set(shifts)).join(', ') : null,
+        skills: skills.length ? Array.from(new Set(skills)).join(', ') : null,
+        benefits: benefits.length ? Array.from(new Set(benefits)).join(', ') : null,
+        verification_status: job.verification_status,
+        no_vacancy: job.no_vacancy,
+        hired_total: job.hired_total,
+        job_state: job.JobState?.state_english || null,
+        job_city: job.JobCity?.city_english || null,
+        is_expired: job.status === 'expired' || !!job.expired_at,
+        job_status: (job.status === 'expired' || !!job.expired_at) ? 'expired' : 'active',
+        job_life: jobLife(job.created_at),
+        created_at: job.created_at
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('[employees] recommended jobs error:', error);
+    res.status(500).json({ success: false, message: error.message || 'Failed to fetch recommended jobs' });
+  }
+});
 
 // Configure multer for certificate uploads
 const certificateStorage = multer.diskStorage({
@@ -152,480 +1053,66 @@ router.post('/:id/documents/upload', docUpload.single('file'), async (req, res) 
     } else {
       doc = await EmployeeDocument.create(payload);
     }
+    await safeLog(req, {
+      category: 'document',
+      type: 'update',
+      redirect_to: employeeRedirect(emp.id),
+      log_text: `Employee document uploaded (${type}): #${emp.id} ${emp.name || '-'}`,
+    });
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(emp.id),
+      log_text: `Employee document updated (employee log): #${emp.id} (${type})`,
+    });
     res.json({ success:true, data: doc });
   } catch (e) {
     console.error('[employee documents] upload error:', e);
     res.status(500).json({ success:false, message:e.message });
   }
-});
+
 
 /**
  * DELETE /employees/:id/documents/:docId
- * Remove a specific document belonging to an employee.
+ * Delete a document for an employee.
  */
 router.delete('/:id/documents/:docId', async (req, res) => {
   try {
-    const emp = await Employee.findByPk(req.params.id);
-    if (!emp) return res.status(404).json({ success:false, message:'Employee not found' });
-    const doc = await EmployeeDocument.findByPk(req.params.docId);
-    if (!doc || doc.user_id !== emp.id)
-      return res.status(404).json({ success:false, message:'Document not found' });
-    await doc.destroy();
-    res.json({ success:true, message:'Document deleted' });
-  } catch (e) {
-    console.error('[employee documents] delete error:', e);
-    res.status(500).json({ success:false, message:e.message });
-  }
-});
+    const employeeId = Number(req.params.id);
+    const docId = Number(req.params.docId);
+    if (!employeeId || !docId) return res.status(400).json({ success: false, message: 'Invalid id' });
 
-/**
- * GET /employees
- * Fetch all employees with their basic associations.
- */
-router.get('/', async (req, res) => {
-  try {
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 25, 1), 200);
-    const sortField = (req.query.sortField || 'id').toString().toLowerCase();
-    const sortDir = (req.query.sortDir || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-    const search = (req.query.search || '').toString().trim().toLowerCase();
-    const subscriptionStatusFilter = (req.query.subscriptionStatusFilter || '').toLowerCase();
-    const statusFilter = (req.query.status || '').toLowerCase();
-    const newFilter = (req.query.newFilter || '').toLowerCase();
-
-    const parseId = (value) => {
-      if (value === undefined || value === null || value === '') return null;
-      const parsed = parseInt(value, 10);
-      return Number.isNaN(parsed) ? null : parsed;
-    };
-    const parseNumberOrNull = (value) => { // added
-      if (value === undefined || value === null || value === '') return null;
-      const n = Number(value);
-      return Number.isNaN(n) ? null : n;
-    };
-
-    const include = baseInclude.map(item => ({ ...item }));
-    const whereClause = {};
-    const andConditions = [];
-
-    const stateId = parseId(req.query.stateFilter);
-    if (stateId !== null) whereClause.state_id = stateId;
-    const cityId = parseId(req.query.cityFilter);
-    if (cityId !== null) whereClause.city_id = cityId;
-    const prefStateId = parseId(req.query.prefStateFilter);
-    if (prefStateId !== null) whereClause.preferred_state_id = prefStateId;
-    const prefCityId = parseId(req.query.prefCityFilter);
-    if (prefCityId !== null) whereClause.preferred_city_id = prefCityId;
-    const qualificationId = parseId(req.query.qualificationFilter);
-    if (qualificationId !== null) whereClause.qualification_id = qualificationId;
-    const shiftId = parseId(req.query.shiftFilter);
-    if (shiftId !== null) whereClause.preferred_shift_id = shiftId;
-    const planId = parseId(req.query.planFilter);
-    if (planId !== null) whereClause.subscription_plan_id = planId;
-
-    if (req.query.salaryFreqFilter) {
-      whereClause.expected_salary_frequency = req.query.salaryFreqFilter.toLowerCase();
-    }
-    if (req.query.genderFilter) {
-      whereClause.gender = req.query.genderFilter.toLowerCase();
-    }
-    if (req.query.verificationFilter) {
-      whereClause.verification_status = req.query.verificationFilter.toLowerCase();
-    }
-    if (req.query.kycFilter) {
-      whereClause.kyc_status = req.query.kycFilter.toLowerCase();
-    }
-
-    // new filters
-    const jobProfileId = parseId(req.query.jobProfileFilter);
-    if (jobProfileId !== null) {
-      andConditions.push(Sequelize.literal(
-        `EXISTS (SELECT 1 FROM employee_job_profiles ejp WHERE ejp.employee_id = Employee.id AND ejp.deleted_at IS NULL AND ejp.job_profile_id = ${sequelize.escape(jobProfileId)})`
-      ));
-    }
-
-    const workNatureId = parseId(req.query.workNatureFilter);
-    const workDurationFilter = parseNumberOrNull(req.query.workDurationFilter);
-    const workDurationFreqFilter = (req.query.workDurationFreqFilter || '').trim().toLowerCase();
-    if (workNatureId !== null || workDurationFilter !== null || workDurationFreqFilter) {
-      const conds = ['ex.user_id = Employee.id', 'ex.deleted_at IS NULL'];
-      if (workNatureId !== null) conds.push(`ex.work_nature_id = ${sequelize.escape(workNatureId)}`);
-      if (workDurationFilter !== null) conds.push(`ex.work_duration = ${sequelize.escape(workDurationFilter)}`);
-      if (workDurationFreqFilter) conds.push(`LOWER(ex.work_duration_frequency) = ${sequelize.escape(workDurationFreqFilter)}`);
-      andConditions.push(Sequelize.literal(
-        `EXISTS (SELECT 1 FROM employee_experiences ex WHERE ${conds.join(' AND ')})`
-      ));
-    }
-
-    if (req.query.createdAt) {
-      const date = new Date(req.query.createdAt);
-      if (!Number.isNaN(date.getTime())) {
-        whereClause.created_at = {
-          [Op.gte]: date,
-          [Op.lt]: new Date(date.getTime() + 24 * 60 * 60 * 1000) // next day
-        };
-      }
-    }
-
-    if (newFilter === 'new') {
-      const newSince = new Date(Date.now() - 48 * 60 * 60 * 1000);
-      andConditions.push(Sequelize.where(col('User.created_at'), { [Op.gte]: newSince }));
-      const userInclude = ensureUserInclude(include);
-      userInclude.required = true;
-    }
-
-    if (subscriptionStatusFilter === 'active') {
-      andConditions.push({
-        [Op.or]: [
-          { credit_expiry_at: null },
-          { credit_expiry_at: { [Op.gt]: new Date() } }
-        ]
-      });
-    } else if (subscriptionStatusFilter === 'expired') {
-      andConditions.push({
-        credit_expiry_at: {
-          [Op.and]: [
-            { [Op.ne]: null },
-            { [Op.lte]: new Date() }
-          ]
-        }
-      });
-    }
-
-    if (search) {
-      const pattern = `%${search}%`;
-      const searchConditions = [
-        Sequelize.where(fn('LOWER', col('Employee.name')), { [Op.like]: pattern }),
-        Sequelize.where(fn('LOWER', col('Employee.email')), { [Op.like]: pattern }),
-        Sequelize.where(fn('LOWER', col('State.state_english')), { [Op.like]: pattern }),
-        Sequelize.where(fn('LOWER', col('City.city_english')), { [Op.like]: pattern })
-      ];
-      const numericId = Number(search);
-      if (!Number.isNaN(numericId)) searchConditions.push({ id: numericId });
-      andConditions.push({ [Op.or]: searchConditions });
-    }
-
-    if (andConditions.length) {
-      whereClause[Op.and] = (whereClause[Op.and] || []).concat(andConditions);
-    }
-
-    const sortableColumns = {
-      id: col('Employee.id'),
-      name: col('Employee.name'),
-      email: col('Employee.email'),
-      dob: col('Employee.dob'),
-      gender: col('Employee.gender'),
-      expected_salary: col('Employee.expected_salary'),
-      verification_status: col('Employee.verification_status'),
-      kyc_status: col('Employee.kyc_status'),
-      created_at: col('Employee.created_at'),
-      state: col('State.state_english'),
-      city: col('City.city_english'),
-      qualification: col('Qualification.qualification_english'),
-      shift: col('Shift.shift_english')
-    };
-    const orderColumn = sortableColumns[sortField] || sortableColumns.id;
-
-    if (['active', 'inactive'].includes(statusFilter)) {
-      const userInclude = ensureUserInclude(include);
-      userInclude.where = { ...(userInclude.where || {}), is_active: statusFilter === 'active' };
-      userInclude.required = true;
-    }
-
-    const { rows, count } = await Employee.findAndCountAll({
-      where: whereClause,
-      include,
-      order: [[orderColumn, sortDir]],
-      limit: pageSize,
-      offset: (page - 1) * pageSize,
-      paranoid: true,
-      distinct: true
-    });
-
-    // attach job profile & work nature displays
-    const employeeIds = rows.map(r => r.id);
-    if (employeeIds.length) {
-      const jpRows = await EmployeeJobProfile.findAll({
-        where: { employee_id: employeeIds },
-        include: [{ model: JobProfile, as: 'JobProfile', attributes: ['profile_english'] }],
-        paranoid: true
-      });
-      const jpMap = new Map();
-      jpRows.forEach(r => {
-        const list = jpMap.get(r.employee_id) || [];
-        if (r.JobProfile?.profile_english) list.push(r.JobProfile.profile_english);
-        jpMap.set(r.employee_id, list);
-      });
-
-      const expRows = await EmployeeExperience.findAll({
-        where: { user_id: employeeIds },
-        include: [{ model: require('../models/WorkNature'), as: 'WorkNature', attributes: ['nature_english'] }],
-        paranoid: true
-      });
-      const expMap = new Map();
-      expRows.forEach(r => {
-        const list = expMap.get(r.user_id) || [];
-        const nature = r.WorkNature?.nature_english || '-';
-        const dur = r.work_duration ? `${r.work_duration}${r.work_duration_frequency ? ` ${r.work_duration_frequency}` : ''}` : '';
-        list.push(`${nature}${dur ? ` (${dur})` : ''}`);
-        expMap.set(r.user_id, list);
-      });
-
-      rows.forEach(r => {
-        r.setDataValue('job_profiles_display', (jpMap.get(r.id) || []).join(', ') || '-');
-        r.setDataValue('work_natures_display', (expMap.get(r.id) || []).join(', ') || '-');
-      });
-    }
-
-    res.json({
-      success: true,
-      data: rows,
-      meta: {
-        page,
-        pageSize,
-        total: count,
-        totalPages: Math.max(Math.ceil(count / pageSize), 1)
-      }
-    });
-  } catch (err) {
-    console.error('[Employees list] error:', err.message);
-    if (/Unknown column/.test(err.message)) {
-      return res.status(500).json({ success: false, message: 'Pending migration: add document columns.' });
-    }
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-/**
- * GET /employees/:id
- * Fetch a single employee with associations.
- */
-router.get('/:id', async (req, res) => {
-  try {
-    const employee = await Employee.findByPk(req.params.id, {
-      include: baseInclude,
-      paranoid: true
-    });
-    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-
-    const jpRows = await EmployeeJobProfile.findAll({ // added
-      where: { employee_id: employee.id },
-      include: [{ model: JobProfile, as: 'JobProfile', attributes: ['profile_english'] }],
-      paranoid: true
-    });
-    const jpNames = jpRows.map(r => r.JobProfile?.profile_english).filter(Boolean);
-    employee.setDataValue('job_profiles_display', jpNames.join(', ') || '-');
-
-    const expRows = await EmployeeExperience.findAll({ // added
-      where: { user_id: employee.id },
-      include: [{ model: require('../models/WorkNature'), as: 'WorkNature', attributes: ['nature_english'] }],
-      paranoid: true
-    });
-    const expNames = expRows.map(r => {
-      const nature = r.WorkNature?.nature_english || '-';
-      const dur = r.work_duration ? `${r.work_duration}${r.work_duration_frequency ? ` ${r.work_duration_frequency}` : ''}` : '';
-      return `${nature}${dur ? ` (${dur})` : ''}`;
-    }).filter(Boolean);
-    employee.setDataValue('work_natures_display', expNames.join(', ') || '-');
-
-    res.json({ success: true, data: employee });
-  } catch (err) {
-    console.error('[Employee detail] error:', err.message);
-    if (/Unknown column/.test(err.message)) {
-      return res.status(500).json({ success: false, message: 'Pending migration: add document columns.' });
-    }
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-/**
- * POST /employees
- * Create a new employee (and user if necessary).
- */
-router.post('/', async (req, res) => {
-  try {
-    console.log('[EMPLOYEE CREATE] req.body:', req.body); // debug log
-    const fail = (message, status = 400) => {
-      const err = new Error(message);
-      err.status = status;
-      throw err;
-    };
-
-    const rawUserId = req.body?.user_id;
-    const normalizedUserId = (() => {
-      if (rawUserId === undefined || rawUserId === null) return null;
-      const trimmed = typeof rawUserId === 'string' ? rawUserId.trim() : rawUserId;
-      if (trimmed === '' || trimmed === false) return null;
-      const parsed = Number(trimmed);
-      return Number.isNaN(parsed) ? null : parsed;
-    })();
-    const mobileInput = (req.body?.mobile || '').trim();
-    let nameInput = (req.body?.name || '').trim();
-    const email = req.body?.email || null;
-    const wantsNewUser = !normalizedUserId;
-
-    if (wantsNewUser && (!mobileInput || !nameInput)) {
-      return res.status(400).json({ success: false, message: 'Required: mobile, name' });
-    }
-
-    // Optional: check duplicate employee email (if provided)
-    if (email) {
-      const existingEmailEmp = await Employee.findOne({ where: { email }, paranoid: false });
-      if (existingEmailEmp && !existingEmailEmp.deleted_at) {
-        return res.status(409).json({ success: false, message: 'An employee with this email already exists.' });
-      }
-    }
-
-    let user;
-    try {
-      if (wantsNewUser) {
-        user = await User.findOne({ where: { mobile: mobileInput }, paranoid: false });
-        if (user && user.deleted_at) await user.restore();
-        if (!user) {
-          user = await User.create({
-            mobile: mobileInput,
-            name: nameInput,
-            user_type: 'employee',
-            is_active: true
-          });
-        }
-      } else {
-        const targetUserId = normalizedUserId;
-        if (!targetUserId) fail('Invalid user_id');
-        user = await User.findByPk(targetUserId, { paranoid: false });
-        if (!user) fail('User not found', 404);
-        if (user.deleted_at) await user.restore();
-        if (!nameInput) nameInput = user.name || '';
-      }
-    } catch (userErr) {
-      console.error('[EMPLOYEE CREATE] user resolve error:', userErr);
-      const status = userErr.status || 500;
-      return res.status(status).json({ success: false, message: userErr.message || 'Failed to resolve user' });
-    }
-
-    if (!nameInput) {
-      return res.status(400).json({ success: false, message: 'Name is required' });
-    }
-
-    if ((user.user_type || '').toLowerCase() !== 'employee') {
-      await user.update({ user_type: 'employee' });
-    }
-
-    // If user exists, check if employee already exists for this user
-    const existingEmp = await Employee.findOne({ where: { user_id: user.id }, paranoid: false });
-    if (existingEmp) {
-      if (existingEmp.deleted_at) {
-        await existingEmp.restore();
-        return res.status(409).json({ success: false, message: 'Employee record for this mobile already existed and was restored. Please retry.' });
-      }
-      return res.status(409).json({ success: false, message: 'An employee for this mobile already exists.' });
-    }
-
-    // Create employee
-    const empPayload = {
-      ...req.body,
-      user_id: user.id,
-      name: nameInput
-    };
-    delete empPayload.mobile; // not a field in Employee
-    // sanitize credit_expiry_at
-    if ('credit_expiry_at' in empPayload) {
-      empPayload.credit_expiry_at = normalizeDateOrNull(empPayload.credit_expiry_at);
-    }
-    // sanitize subscription_plan_id
-    if ('subscription_plan_id' in empPayload) {
-      empPayload.subscription_plan_id = normalizeIntOrNull(empPayload.subscription_plan_id);
-    }
-    const emp = await Employee.create(empPayload);
-    res.status(201).json({ success: true, data: emp });
-  } catch (error) {
-    console.error('Employee create error:', error);
-    // Provide clearer duplicate messages
-    if (error.name === 'SequelizeUniqueConstraintError') {
-      const fields = Object.keys(error.fields || {});
-      const field = fields[0];
-      const msg = field === 'email'
-        ? 'An employee with this email already exists.'
-        : 'Duplicate value for a unique field.';
-      return res.status(409).json({ success: false, message: msg });
-    }
-    const status = /unique/i.test(error.message) ? 409 : 500;
-    res.status(status).json({ success: false, message: error.message });
-  }
-});
-
-/**
- * PUT /employees/:id
- * Update employee details and linked user info.
- */
-router.put('/:id', async (req, res) => {
-  try {
-    const emp = await Employee.findByPk(req.params.id);
+    const emp = await Employee.findByPk(employeeId, { paranoid: false });
     if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
 
-    const payload = { ...req.body };
-    delete payload.mobile;
-    if ('credit_expiry_at' in payload) {
-      payload.credit_expiry_at = normalizeDateOrNull(payload.credit_expiry_at);
-    }
-    // sanitize subscription_plan_id when provided
-    if ('subscription_plan_id' in payload) {
-      payload.subscription_plan_id = normalizeIntOrNull(payload.subscription_plan_id);
+    const doc = await EmployeeDocument.findByPk(docId, { paranoid: false });
+    if (!doc || Number(doc.user_id) != employeeId) {
+      return res.status(404).json({ success: false, message: 'Document not found' });
     }
 
-    const requestedUserId = payload.user_id ?? emp.user_id;
+    await doc.destroy();
 
-    let targetUser = await User.findByPk(requestedUserId, { paranoid: false });
-    if (!targetUser) {
-      return res.status(400).json({ success: false, message: 'User not found' });
-    }
-    if (targetUser.deleted_at) await targetUser.restore();
+    await safeLog(req, {
+      category: 'document',
+      type: 'delete',
+      redirect_to: employeeRedirect(employeeId),
+      log_text: `Employee document deleted: employee #${employeeId} doc #${docId}`,
+    });
 
-    if (requestedUserId !== emp.user_id) {
-      const existingEmp = await Employee.findOne({
-        where: { user_id: requestedUserId },
-        paranoid: false
-      });
-      if (existingEmp && existingEmp.id !== emp.id) {
-        return res.status(409).json({ success: false, message: 'Another employee already uses this user.' });
-      }
-      payload.user_id = requestedUserId;
-    }
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(employeeId),
+      log_text: `Employee document deleted (employee log): #${employeeId} doc #${docId}`,
+    });
 
-    if (req.body.mobile !== undefined) {
-      const newMobile = String(req.body.mobile || '').trim();
-      if (!newMobile) {
-        return res.status(400).json({ success: false, message: 'Mobile cannot be empty' });
-      }
-      if (newMobile !== String(targetUser.mobile || '').trim()) {
-        const duplicate = await User.findOne({
-          where: { mobile: newMobile },
-          paranoid: false
-        });
-        if (duplicate && duplicate.id !== targetUser.id) {
-          return res.status(409).json({ success: false, message: 'Mobile already exists.' });
-        }
-        await targetUser.update({ mobile: newMobile });
-      }
-    }
-
-    if (req.body.name !== undefined) {
-      const trimmedName = String(req.body.name || '').trim();
-      if (!trimmedName) {
-        return res.status(400).json({ success: false, message: 'Name cannot be empty' });
-      }
-      if (trimmedName !== targetUser.name) {
-        await targetUser.update({ name: trimmedName });
-      }
-      payload.name = trimmedName;
-    }
-
-    await emp.update(payload);
-    res.json({ success: true, data: emp });
-  } catch (error) {
-    console.error('Employee update error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    return res.json({ success: true, message: 'Deleted' });
+  } catch (e) {
+    console.error('[employee documents] delete error:', e);
+    return res.status(500).json({ success: false, message: e.message });
   }
+});
 });
 
 /**
@@ -634,18 +1121,21 @@ router.put('/:id', async (req, res) => {
  */
 router.delete('/:id', async (req, res) => {
   try {
-    const emp = await Employee.findByPk(req.params.id, { paranoid: false });
-    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
-
-    const user = await User.findByPk(emp.user_id, { paranoid: false });
-
-    await emp.destroy();
-    await markUserAsDeleted(user);
-
+    const adminId = getAdminId(req);
+    const employeeId = Number(req.params.id);
+    const employee = employeeId ? await Employee.findByPk(employeeId, { paranoid: false }) : null;
+    await deleteByEmployeeId(req.params.id, { deletedByAdminId: adminId ? Number(adminId) : undefined });
+    await safeLog(req, {
+      category: 'employee',
+      type: 'delete',
+      redirect_to: '/employees',
+      log_text: `Employee deleted: #${employeeId || req.params.id} ${employee?.name || '-'}`,
+    });
     res.json({ success: true, message: 'Employee deleted' });
   } catch (error) {
     console.error('Employee delete error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    const status = error?.status && Number.isFinite(error.status) ? error.status : 500;
+    res.status(status).json({ success: false, message: error.message });
   }
 });
 
@@ -674,7 +1164,7 @@ router.get('/:id/job-profiles', async (req, res) => {
  * POST /employees/:id/job-profiles
  * Replace employee job profiles (maximum three).
  */
-router.post('/:id/job-profiles', async (req, res) => {
+router.post('/:id/job-profiles', authenticate, async (req, res) => {
   try {
     const employeeId = parseInt(req.params.id);
     if (!employeeId || Number.isNaN(employeeId)) {
@@ -691,6 +1181,12 @@ router.post('/:id/job-profiles', async (req, res) => {
     const ids = [...new Set(incoming.map(n => parseInt(n)).filter(n => !Number.isNaN(n)))].slice(0, 3);
     if (ids.length === 0) {
       await EmployeeJobProfile.destroy({ where: { employee_id: employeeId } });
+      await safeLog(req, {
+        category: 'employee',
+        type: 'update',
+        redirect_to: employeeRedirect(employeeId),
+        log_text: `Employee job profiles updated: #${employeeId} cleared`,
+      });
       return res.json({ success: true, data: [] });
     }
     const foundProfiles = await JobProfile.findAll({ where: { id: ids }, paranoid: true });
@@ -753,6 +1249,12 @@ router.post('/:id/job-profiles', async (req, res) => {
       where: { employee_id: employeeId },
       include: [{ model: JobProfile, as: 'JobProfile' }],
       paranoid: true
+    });
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(employeeId),
+      log_text: `Employee job profiles updated: #${employeeId} -> [${ids.join(', ')}]`,
     });
     res.json({ success: true, data: rows });
   } catch (err) {
@@ -826,6 +1328,19 @@ router.post('/:id/experiences', async (req, res) => {
       work_nature_id: work_nature_id || null,
       experience_certificate: experience_certificate || null
     });
+    await safeLog(req, {
+      category: 'experience',
+      type: 'add',
+      redirect_to: employeeRedirect(emp.id),
+      log_text: `Experience created: employee #${emp.id} (${emp.name || '-'}) firm=${previous_firm}`,
+    });
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(emp.id),
+      log_text: `Experience created (employee log): employee #${emp.id} firm=${previous_firm}`,
+    });
     res.status(201).json({ success:true, data: exp });
   } catch (e) {
     console.error('[experiences] create error', e);
@@ -850,6 +1365,19 @@ router.put('/:id/experiences/:expId', async (req, res) => {
       if (payload[f] === '') payload[f] = null;
     });
     await exp.update(payload);
+    await safeLog(req, {
+      category: 'experience',
+      type: 'update',
+      redirect_to: employeeRedirect(emp.id),
+      log_text: `Experience updated: employee #${emp.id} exp #${exp.id}`,
+    });
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(emp.id),
+      log_text: `Experience updated (employee log): employee #${emp.id} exp #${exp.id}`,
+    });
     res.json({ success:true, data: exp });
   } catch (e) {
     console.error('[experiences] update error', e);
@@ -870,6 +1398,19 @@ router.delete('/:id/experiences/:expId', async (req, res) => {
       return res.status(404).json({ success:false, message:'Experience not found' });
     }
     await exp.destroy();
+    await safeLog(req, {
+      category: 'experience',
+      type: 'delete',
+      redirect_to: employeeRedirect(emp.id),
+      log_text: `Experience deleted: employee #${emp.id} exp #${req.params.expId}`,
+    });
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(emp.id),
+      log_text: `Experience deleted (employee log): employee #${emp.id} exp #${req.params.expId}`,
+    });
     res.json({ success:true, message:'Deleted' });
   } catch (e) {
     console.error('[experiences] delete error', e);
@@ -883,13 +1424,17 @@ router.delete('/:id/experiences/:expId', async (req, res) => {
  */
 router.get('/:id/applications', async (req, res) => {
   try {
-    const emp = await Employee.findByPk(req.params.id);
+    const employeeId = parseInt(req.params.id, 10);
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
+
+    // employees table -> employee KYC status
+    const emp = await Employee.findByPk(employeeId, { attributes: ['id', 'kyc_status'], paranoid: false });
     if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
 
-    // Fetch all job interests where this employee is sender or receiver
+    // job_interests (base)
     const interests = await JobInterest.findAll({
       where: {
-        [require('sequelize').Op.or]: [
+        [Op.or]: [
           { sender_type: 'employee', sender_id: emp.id },
           { sender_type: 'employer', receiver_id: emp.id }
         ]
@@ -898,47 +1443,59 @@ router.get('/:id/applications', async (req, res) => {
       paranoid: true
     });
 
-    // Collect job and employer IDs
-    const jobIds = [...new Set(interests.map(i => i.job_id))];
+    if (!interests.length) {
+      return res.json({ success: true, data: { sent: [], received: [] } });
+    }
+
+    const jobIds = [...new Set(interests.map(i => i.job_id).filter(Boolean))];
     const employerIds = [...new Set(
-      interests.map(i =>
-        i.sender_type === 'employee'
-          ? i.receiver_id
-          : (i.sender_type === 'employer' ? i.sender_id : null)
-      ).filter(Boolean)
+      interests
+        .map(i => (i.sender_type === 'employee' ? i.receiver_id : (i.sender_type === 'employer' ? i.sender_id : null)))
+        .filter(Boolean)
     )];
 
-    // Fetch jobs and employers in bulk
-    const jobs = await Job.findAll({
-      where: { id: jobIds },
-      include: [
-        { model: JobProfile, as: 'JobProfile', attributes: ['id', 'profile_english'] },
-        { model: State, as: 'JobState', attributes: ['state_english'] },
-        { model: City, as: 'JobCity', attributes: ['city_english'] }
-      ],
-      paranoid: false
-    });
+    // join with Job to get job status (+ other job fields the UI already uses)
+    const jobs = jobIds.length
+      ? await Job.findAll({
+          where: { id: jobIds },
+          include: [
+            { model: JobProfile, as: 'JobProfile', attributes: ['id', 'profile_english'] },
+            { model: State, as: 'JobState', attributes: ['state_english'] },
+            { model: City, as: 'JobCity', attributes: ['city_english'] }
+          ],
+          paranoid: false
+        })
+      : [];
     const jobsMap = {};
     jobs.forEach(j => { jobsMap[j.id] = j; });
 
-    const employers = await Employer.findAll({
-      where: { id: employerIds },
-      attributes: ['id', 'name', 'organization_name'],
-      paranoid: false
-    });
+    // join Employer -> User to get employer phone
+    const employers = employerIds.length
+      ? await Employer.findAll({
+          where: { id: employerIds },
+          attributes: ['id', 'name', 'organization_name'],
+          include: [{ model: User, as: 'User', attributes: ['mobile'], required: false, paranoid: false }],
+          paranoid: false
+        })
+      : [];
     const employersMap = {};
     employers.forEach(e => { employersMap[e.id] = e; });
 
-    // Compose sent and received arrays
     const sent = [];
     const received = [];
+
     for (const i of interests) {
       const job = jobsMap[i.job_id];
-      const employerId = i.sender_type === 'employee' ? i.receiver_id : (i.sender_type === 'employer' ? i.sender_id : null);
+      const employerId =
+        i.sender_type === 'employee'
+          ? i.receiver_id
+          : (i.sender_type === 'employer' ? i.sender_id : null);
       const employer = employerId ? employersMap[employerId] : null;
+
+      // keep behavior: if job/employer missing, skip row
       if (!job || !employer) continue;
 
-      const vacancyLeft = (job.no_vacancy || 0) - (job.hired_total || 0);
+      const vacancyLeft = (Number(job.no_vacancy || 0) - Number(job.hired_total || 0));
 
       const row = {
         id: i.id,
@@ -947,6 +1504,8 @@ router.get('/:id/applications', async (req, res) => {
         employer_id: employer.id,
         employer_name: employer.name,
         organization_name: employer.organization_name,
+        employer_phone: employer.User?.mobile || null, // NEW (via join)
+
         job_state: job.JobState?.state_english || '',
         job_city: job.JobCity?.city_english || '',
         salary_min: job.salary_min,
@@ -954,17 +1513,17 @@ router.get('/:id/applications', async (req, res) => {
         total_vacancy: job.no_vacancy,
         hired_total: job.hired_total,
         vacancy_left: vacancyLeft,
+
+        employee_kyc_status: emp.kyc_status || null, // NEW (employees table)
+        job_status: job.status || null,              // NEW
+
         status: i.status === 'pending' ? 'Active' : i.status,
-        otp: i.otp || null,
         applied_at: i.created_at,
         received_at: i.created_at
       };
 
-      if (i.sender_type === 'employee') {
-        sent.push(row);
-      } else if (i.sender_type === 'employer') {
-        received.push(row);
-      }
+      if (i.sender_type === 'employee') sent.push(row);
+      else if (i.sender_type === 'employer') received.push(row);
     }
 
     res.json({ success: true, data: { sent, received } });
@@ -983,7 +1542,6 @@ router.get('/:id/hired-jobs', async (req, res) => {
     const emp = await Employee.findByPk(req.params.id);
     if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
 
-    // Find all JobInterest rows where employee is sender or receiver and status is 'hired'
     const interests = await JobInterest.findAll({
       where: {
         status: 'hired',
@@ -996,7 +1554,6 @@ router.get('/:id/hired-jobs', async (req, res) => {
       paranoid: true
     });
 
-    // Collect job and employer IDs
     const jobIds = [...new Set(interests.map(i => i.job_id))];
     const employerIds = [...new Set(
       interests.map(i =>
@@ -1006,7 +1563,6 @@ router.get('/:id/hired-jobs', async (req, res) => {
       ).filter(Boolean)
     )];
 
-    // Fetch jobs and employers in bulk
     const jobs = await Job.findAll({
       where: { id: jobIds },
       include: [
@@ -1019,15 +1575,16 @@ router.get('/:id/hired-jobs', async (req, res) => {
     const jobsMap = {};
     jobs.forEach(j => { jobsMap[j.id] = j; });
 
+    // CHANGED: include Employer.kyc_status + Employer.User.mobile (phone)
     const employers = await Employer.findAll({
       where: { id: employerIds },
-      attributes: ['id', 'name', 'organization_name'],
+      attributes: ['id', 'name', 'organization_name', 'kyc_status'],
+      include: [{ model: User, as: 'User', attributes: ['mobile'], required: false, paranoid: false }],
       paranoid: false
     });
     const employersMap = {};
     employers.forEach(e => { employersMap[e.id] = e; });
 
-    // Compose hired jobs array
     const hired = [];
     for (const i of interests) {
       const job = jobsMap[i.job_id];
@@ -1044,6 +1601,12 @@ router.get('/:id/hired-jobs', async (req, res) => {
         employer_id: employer.id,
         employer_name: employer.name,
         organization_name: employer.organization_name,
+
+        // NEW
+        employer_phone: employer.User?.mobile || null,
+        employer_kyc_status: employer.kyc_status || null,
+        job_status: job.status || null,
+
         job_state: job.JobState?.state_english || '',
         job_city: job.JobCity?.city_english || '',
         salary_min: job.salary_min,
@@ -1138,47 +1701,43 @@ router.get('/:id/wishlist', async (req, res) => {
  */
 router.get('/:id/credit-history', async (req, res) => {
   try {
-    const employeeId = parseInt(req.params.id);
+    const employeeId = parseInt(req.params.id, 10);
     if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
 
-    // Fetch employee_contacts for this employee
+    // CONTACT credits
     const contacts = await EmployeeContact.findAll({
       where: { employee_id: employeeId },
       paranoid: false,
       order: [['created_at', 'DESC']]
     });
 
-    // If no contacts, return empty
-    if (!contacts.length) return res.json({ success: true, data: [] });
+    const employerIds = [...new Set(contacts.map(c => c.employer_id).filter(Boolean))];
+    const callExperienceIds = [...new Set(contacts.map(c => c.call_experience_id).filter(Boolean))];
 
-    // Collect employer_ids and call_experience_ids
-    const employerIds = contacts.map(c => c.employer_id);
-    const callExperienceIds = contacts.map(c => c.call_experience_id).filter(Boolean);
-
-    // Fetch employers and their users
-    const Employer = require('../models/Employer');
-    const User = require('../models/User');
-    const employers = await Employer.findAll({
-      where: { id: employerIds },
-      include: [
-        { model: User, as: 'User', attributes: ['id', 'mobile'] }
-      ],
-      paranoid: false
-    });
+    const employers = employerIds.length
+      ? await Employer.findAll({
+          where: { id: employerIds },
+          include: [{ model: User, as: 'User', attributes: ['id', 'mobile'], required: false, paranoid: false }],
+          paranoid: false
+        })
+      : [];
     const employerMap = {};
     employers.forEach(e => { employerMap[e.id] = e; });
 
-    // Fetch call histories for these contacts (user_type: employee)
-    const callHistories = await CallHistory.findAll({
-      where: {
-        call_experience_id: callExperienceIds,
-        user_type: 'employee'
-      },
-      paranoid: false
-    });
+    const callHistories = callExperienceIds.length
+      ? await CallHistory.findAll({
+          where: {
+            call_experience_id: callExperienceIds,
+            user_type: 'employee'
+          },
+          paranoid: false
+        })
+      : [];
+
     const callHistoryMap = {};
     const employeeExpIds = new Set();
     const employerExpIds = new Set();
+
     callHistories.forEach(ch => {
       callHistoryMap[ch.id] = ch;
       if (ch.call_experience_id) {
@@ -1186,16 +1745,19 @@ router.get('/:id/credit-history', async (req, res) => {
         else if (ch.user_type === 'employer') employerExpIds.add(ch.call_experience_id);
       }
     });
+
     const employeeExpMap = {};
     if (employeeExpIds.size && EmployeeCallExperience) {
       const exps = await EmployeeCallExperience.findAll({ where: { id: [...employeeExpIds] }, paranoid: false });
       exps.forEach(exp => { employeeExpMap[exp.id] = exp; });
     }
+
     const employerExpMap = {};
     if (employerExpIds.size && EmployerCallExperience) {
       const exps = await EmployerCallExperience.findAll({ where: { id: [...employerExpIds] }, paranoid: false });
       exps.forEach(exp => { employerExpMap[exp.id] = exp; });
     }
+
     const getCallExperienceLabel = (history) => {
       if (!history?.call_experience_id) return '-';
       if (history.user_type === 'employee') {
@@ -1208,6 +1770,7 @@ router.get('/:id/credit-history', async (req, res) => {
       }
       return '-';
     };
+
     const contactData = contacts.map(c => {
       const employer = employerMap[c.employer_id];
       const user = employer?.User;
@@ -1228,8 +1791,65 @@ router.get('/:id/credit-history', async (req, res) => {
       };
     });
 
-    // Placeholder for interest credits (empty for now)
-    const interestData = []; // You can implement logic for interest credits if needed
+    // INTEREST credits (based on job_interests sent by this employee)
+    const interests = await JobInterest.findAll({
+      where: {
+        sender_type: 'employee',
+        sender_id: employeeId
+      },
+      order: [['created_at', 'DESC']],
+      paranoid: true
+    });
+
+    const interestJobIds = [...new Set(interests.map(i => i.job_id).filter(Boolean))];
+    const interestEmployerIds = [...new Set(interests.map(i => i.receiver_id).filter(Boolean))];
+
+    const jobs = interestJobIds.length
+      ? await Job.findAll({
+          where: { id: interestJobIds },
+          include: [{ model: JobProfile, as: 'JobProfile', attributes: ['id', 'profile_english'], required: false }],
+          paranoid: false
+        })
+      : [];
+    const jobsMap = {};
+    jobs.forEach(j => { jobsMap[j.id] = j; });
+
+    const interestEmployers = interestEmployerIds.length
+      ? await Employer.findAll({
+          where: { id: interestEmployerIds },
+          attributes: ['id', 'name', 'organization_name'],
+          include: [{ model: User, as: 'User', attributes: ['mobile'], required: false, paranoid: false }],
+          paranoid: false
+        })
+      : [];
+    const interestEmployersMap = {};
+    interestEmployers.forEach(e => { interestEmployersMap[e.id] = e; });
+
+    const interestData = interests.map(i => {
+      const job = jobsMap[i.job_id];
+      const employer = interestEmployersMap[i.receiver_id];
+      if (!job || !employer) return null;
+
+      return {
+        type: 'interest',
+        amount: 1,
+
+        job_id: job.id,
+        employer_id: employer.id,
+
+        job_profile: job.JobProfile?.profile_english || '-',
+        employer_name: employer.name || '-',
+        organization_name: employer.organization_name || '-',
+        employer_mobile: employer.User?.mobile || null,
+        employer_phone: employer.User?.mobile || null,
+
+        job_status: job.status || null,
+        job_interest_status: i.status || null,
+
+        created_at: i.created_at,
+        date: i.created_at,
+      };
+    }).filter(Boolean);
 
     res.json({ success: true, data: [...contactData, ...interestData] });
   } catch (err) {
@@ -1251,9 +1871,7 @@ router.get('/:id/call-experiences', async (req, res) => {
     const CallHistory = require('../models/CallHistory');
     const EmployeeCallExperience = require('../models/EmployeeCallExperience');
     const EmployeeContact = require('../models/EmployeeContact');
-    const Employer = require('../models/Employer');
-    const Job = require('../models/Job');
-
+        
     const emp = await Employee.findByPk(employeeId);
     if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
 
@@ -1365,8 +1983,7 @@ router.get('/:id/call-reviews', async (req, res) => {
     const EmployerContact = require('../models/EmployerContact');
     const CallHistory = require('../models/CallHistory');
     const EmployerCallExperience = require('../models/EmployerCallExperience');
-    const Employer = require('../models/Employer');
-
+    
     const emp = await Employee.findByPk(employeeId);
     if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
 
@@ -1379,6 +1996,7 @@ router.get('/:id/call-reviews', async (req, res) => {
 
     const callHistoryIds = [...new Set(contacts.map(c => c.call_experience_id).filter(Boolean))];
     const employerIds = [...new Set(contacts.map(c => c.employer_id).filter(Boolean))];
+
     const histories = callHistoryIds.length
       ? await CallHistory.findAll({
           where: { user_type: 'employer', id: callHistoryIds },
@@ -1386,15 +2004,27 @@ router.get('/:id/call-reviews', async (req, res) => {
           paranoid: true
         })
       : [];
+
     const expIds = [...new Set(histories.map(h => h.call_experience_id).filter(Boolean))];
     let expMap = {};
     if (expIds.length && EmployerCallExperience) {
       const exps = await EmployerCallExperience.findAll({ where: { id: expIds }, paranoid: false });
       exps.forEach(e => { expMap[e.id] = e; });
     }
+
+    // NEW: build employerMap (was missing)
+    const employerMap = {};
+    if (employerIds.length) {
+      const employers = await Employer.findAll({
+        where: { id: employerIds },
+        attributes: ['id', 'name'],
+        paranoid: false
+      });
+      employers.forEach(e => { employerMap[e.id] = e; });
+    }
+
     const contactsMap = new Map(contacts.map(c => [c.call_experience_id, c]));
 
-    // Compose rows
     const data = histories.map(h => {
       const contact = contactsMap.get(h.id);
       const employer = contact ? employerMap[contact.employer_id] : null;
@@ -1413,275 +2043,80 @@ router.get('/:id/call-reviews', async (req, res) => {
 
     res.json({ success: true, data });
   } catch (err) {
-    console.error('[employees/:id/call-reviews] error:', err);
+    console.error('[employees/:id/call-reviews] error', err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
-
-/**
- * GET /employees/:id/voilations-reported
- * List violation reports filed by employers against this employee.
- */
-router.get('/:id/voilations-reported', async (req, res) => {
-  try {
-    const employeeId = parseInt(req.params.id, 10);
-    if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
-
-    const employee = await Employee.findByPk(employeeId);
-    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-
-    const Report = require('../models/Report');
-    const EmployeeReportReason = require('../models/EmployeeReportReason');
-    const Employer = require('../models/Employer');
-    const Job = require('../models/Job');
-    const JobProfile = require('../models/JobProfile');
-
-    const reports = await Report.findAll({
-      where: { report_type: 'job', user_id: employeeId },
-      order: [['created_at', 'DESC']],
-      paranoid: false
-    });
-    if (!reports.length) return res.json({ success: true, data: [] });
-
-    const employerIds = [...new Set(reports.map(r => r.user_id).filter(Boolean))];
-    const reasonIds = [...new Set(reports.map(r => r.reason_id).filter(Boolean))];
-    const jobIds = [...new Set(reports.map(r => r.report_id).filter(Boolean))];
-
-    const employers = employerIds.length
-      ? await Employer.findAll({ where: { id: employerIds }, attributes: ['id', 'name'], paranoid: false })
-      : [];
-    const employerMap = new Map(employers.map(e => [e.id, e]));
-
-    const reasons = reasonIds.length
-      ? await EmployeeReportReason.findAll({ where: { id: reasonIds }, attributes: ['id', 'reason_english', 'reason_hindi'], paranoid: false })
-      : [];
-    const reasonMap = new Map(reasons.map(r => [r.id, r]));
-
-    let jobMap = new Map();
-    if (jobIds.length) {
-      const jobs = await Job.findAll({
-        where: { id: jobIds },
-        include: [{ model: JobProfile, as: 'JobProfile', attributes: ['profile_english'] }],
-        paranoid: false
-      });
-      jobMap = new Map(jobs.map(j => [j.id, j]));
-    }
-
-    const data = reports.map(r => {
-      const employer = employerMap.get(r.user_id);
-      const reason = reasonMap.get(r.reason_id);
-      const job = jobMap.get(r.report_id); // use report_id (job id) to resolve job info
-      return {
-        id: r.id,
-        employer_id: employer?.id || null,
-        employer_name: employer?.name || '-',
-        reason_english: reason?.reason_english || '-',
-        reason_hindi: reason?.reason_hindi || '',
-        description: r.description || '',
-        job_id: job?.id || r.report_id || null,
-        job_name: job?.JobProfile?.profile_english || '-',
-        created_at: r.created_at,
-        read_at: r.read_at
-      };
-    });
-
-    res.json({ success: true, data });
-  } catch (err) {
-    console.error('[employees/:id/voilations-reported] error:', err);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// ==============================
-// ========== NEW CODE ==========
-// ==============================
-
-// Helper to fetch employee with user (non-paranoid)
-const fetchEmployeeWithUser = async (employeeId) => {
-  return Employee.findByPk(employeeId, {
-    include: [{ model: User, as: 'User', paranoid: false }],
-    paranoid: false
-  });
-};
-
-// Ensure employee user exists and restore if deleted
-const ensureEmployeeUser = async (employee) => {
-  if (employee?.User) return employee.User;
-  const user = await User.findByPk(employee.user_id, { paranoid: false });
-  if (user?.deleted_at) await user.restore();
-  return user;
-};
-
-const handleEmployeeStatusMutation = async (req, res, field, value, message) => {
-  try {
-    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
-    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-    await employee.update({ [field]: value });
-    res.json({ success: true, message });
-  } catch (error) {
-    console.error(`[employees:${field}] error`, error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
 
 /**
  * POST /employees/:id/activate
  * Activate an employee and their linked user.
  */
-router.post('/:id/activate', async (req, res) => {
+router.post('/:id/activate', authenticate, async (req, res) => {
 	try {
-		const employee = await fetchEmployeeWithUser(req.params.id);
+		const employeeId = Number(req.params.id);
+		if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
+
+		const employee = await Employee.findByPk(employeeId);
 		if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-		const user = await ensureEmployeeUser(employee);
-		if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-		await user.update({ is_active: true });
-		res.json({ success: true, message: 'Employee activated' });
+
+		const user = await User.findByPk(employee.user_id, { paranoid: false });
+		if (!user) return res.status(404).json({ success: false, message: 'Linked user not found' });
+
+		await user.update({
+      is_active: true,
+      deactivation_reason: null,
+      status_change_by: getAdminId(req),
+    });
+
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(employee.id),
+      log_text: `Employee activated: #${employee.id} ${employee.name || '-'}`,
+    });
+
+		return res.json({ success: true, message: 'Employee activated', data: { user_id: user.id, employee_id: employee.id } });
 	} catch (error) {
 		console.error('[employees:activate] error', error);
-		res.status(500).json({ success: false, message: error.message });
+		return res.status(500).json({ success: false, message: error.message || 'Activate failed' });
 	}
 });
 
-router.post('/:id/deactivate', async (req, res) => {
-	try {
-		const employee = await fetchEmployeeWithUser(req.params.id);
-		if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-		const user = await ensureEmployeeUser(employee);
-		if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-		await user.update({ is_active: false });
-		res.json({ success: true, message: 'Employee deactivated' });
-	} catch (error) {
-		console.error('[employees:deactivate] error', error);
-		res.status(500).json({ success: false, message: error.message });
-	}
-});
-
-router.post('/:id/approve', async (req, res) => {
+/**
+ * POST /employees/:id/deactivate  { deactivation_reason }
+ */
+router.post('/:id/deactivate', authenticate, async (req, res) => {
   try {
-    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
+    const employeeId = Number(req.params.id);
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
+
+    const reason = (req.body?.deactivation_reason || '').toString().trim();
+    if (!reason) return res.status(400).json({ success: false, message: 'deactivation_reason is required' });
+
+    const employee = await Employee.findByPk(employeeId);
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
+
     const user = await User.findByPk(employee.user_id, { paranoid: false });
-    if (user && user.deleted_at) await user.restore();
-    await employee.update({ is_approved: true });
-    res.json({ success: true, message: 'Employee approved' });
-  } catch (error) {
-    console.error('[employees:approve] error', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
+    if (!user) return res.status(404).json({ success: false, message: 'Linked user not found' });
 
-router.post('/:id/reject', async (req, res) => {
-  try {
-    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
-    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-    await employee.update({ is_approved: false });
-    res.json({ success: true, message: 'Employee rejected' });
-  } catch (error) {
-    console.error('[employees:reject] error', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// --- new: employee KYC grant/reject ---
-router.post('/:id/kyc/grant', async (req, res) => {
-  try {
-    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
-    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-    await employee.update({ kyc_status: 'verified' });
-    res.json({ success: true, message: 'KYC marked as verified' });
-  } catch (error) {
-    console.error('[employees:kyc/grant] error', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-router.post('/:id/kyc/reject', async (req, res) => {
-  try {
-    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
-    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-    await employee.update({ kyc_status: 'rejected' });
-    res.json({ success: true, message: 'KYC rejected' });
-  } catch (error) {
-    console.error('[employees:kyc/reject] error', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// --- new: change subscription ---
-router.post('/:id/change-subscription', async (req, res) => {
-  try {
-    const { subscription_plan_id } = req.body || {};
-    if (!subscription_plan_id) {
-      return res.status(400).json({ success: false, message: 'subscription_plan_id is required' });
-    }
-    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
-    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-
-    const plan = await EmployeeSubscriptionPlan.findByPk(subscription_plan_id);
-    if (!plan) return res.status(404).json({ success: false, message: 'Plan not found' });
-
-    const validityDays = Number(plan.plan_validity_days) || 0;
-    const expiryAt = validityDays ? new Date(Date.now() + validityDays * 24 * 60 * 60 * 1000) : null;
-
-    await employee.update({
-      subscription_plan_id: plan.id,
-      total_contact_credit: Number(plan.contact_credits) || 0,
-      total_interest_credit: Number(plan.interest_credits) || 0,
-      contact_credit: 0,
-      interest_credit: 0,
-      credit_expiry_at: expiryAt
+    await user.update({
+      is_active: false,
+      deactivation_reason: reason,
+      status_change_by: getAdminId(req),
     });
 
-    res.json({
-      success: true,
-      message: 'Subscription updated',
-      data: {
-        subscription_plan_id: plan.id,
-        credit_expiry_at: expiryAt,
-        total_contact_credit: employee.total_contact_credit,
-        total_interest_credit: employee.total_interest_credit
-      }
+    await safeLog(req, {
+      category: 'employee',
+      type: 'update',
+      redirect_to: employeeRedirect(employee.id),
+      log_text: `Employee deactivated: #${employee.id} ${employee.name || '-'} (reason=${reason})`,
     });
+
+    return res.json({ success: true, message: 'Employee deactivated', data: { user_id: user.id, employee_id: employee.id } });
   } catch (error) {
-    console.error('[employees:change-subscription] error', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// --- new: add credits ---
-router.post('/:id/add-credits', async (req, res) => {
-  try {
-    const contactDelta = Number(req.body?.contact_credits) || 0;
-    const interestDelta = Number(req.body?.interest_credits) || 0;
-    if (contactDelta <= 0 && interestDelta <= 0) {
-      return res.status(400).json({ success: false, message: 'Provide credits to add' });
-    }
-
-    const employee = await Employee.findByPk(req.params.id, { paranoid: false });
-    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
-
-    const updatePayload = {
-      total_contact_credit: Number(employee.total_contact_credit || 0) + Math.max(contactDelta, 0),
-      total_interest_credit: Number(employee.total_interest_credit || 0) + Math.max(interestDelta, 0)
-    };
-    if (req.body?.credit_expiry_at) {
-      updatePayload.credit_expiry_at = normalizeDateOrNull(req.body.credit_expiry_at);
-    }
-
-    await employee.update(updatePayload);
-
-    res.json({
-      success: true,
-      message: 'Credits updated',
-      data: {
-        total_contact_credit: employee.total_contact_credit,
-        total_interest_credit: employee.total_interest_credit,
-        credit_expiry_at: employee.credit_expiry_at
-      }
-    });
-  } catch (error) {
-    console.error('[employees:add-credits] error', error);
-    res.status(500).json({ success: false, message: error.message });
+    console.error('[employees:deactivate] error', error);
+    return res.status(500).json({ success: false, message: error.message || 'Deactivate failed' });
   }
 });
 
@@ -1702,19 +2137,24 @@ router.get('/:id/referrals', async (req, res) => {
       order: [['created_at', 'DESC']]
     });
     const userIds = [...new Set(rows.map(r => r.user_id).filter(Boolean))];
+    
+    // CHANGED: fetch User records (with mobile) instead of just names
     const users = userIds.length
       ? await User.findAll({
           where: { id: userIds },
-          attributes: ['id', 'name'],
+          attributes: ['id', 'name', 'mobile'], // NEW: include mobile
           paranoid: false
         })
       : [];
-    const userMap = new Map(users.map(u => [u.id, u.name]));
+    const userMap = new Map(users.map(u => [u.id, u]));
+    
     const data = rows.map(row => {
       const plain = row.get ? row.get({ plain: true }) : row;
+      const user = userMap.get(plain.user_id);
       return {
         ...plain,
-        user_name: plain.user_name || userMap.get(plain.user_id) || plain.user_name || '-'
+        user_name: plain.user_name || user?.name || '-',
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 user_mobile: user?.mobile || null // NEW
       };
     });
     res.json({ success: true, data });
@@ -1724,4 +2164,129 @@ router.get('/:id/referrals', async (req, res) => {
   }
 });
 
+/**
+ * GET /employees/:id/voilations-reported
+ * GET /employees/:id/violations-reported
+ * List violation reports filed BY this employee (kept both spellings for compatibility).
+ *
+ * If report_type is 'job':
+ * - report_id is job_id
+ * - join jobs -> employer_id -> employers.name
+ * - include jobs.status as job_status
+ */
+const listEmployeeViolationsReported = async (req, res) => {
+  try {
+    const employeeId = parseInt(req.params.id, 10);
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
+
+    const emp = await Employee.findByPk(employeeId, { attributes: ['id'], paranoid: false });
+    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    const reports = await Report.findAll({
+      where: { user_id: employeeId, report_type: 'job' },
+      order: [['created_at', 'DESC']],
+      paranoid: false
+    });
+
+    if (!reports.length) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const jobIds = [...new Set(reports.map(r => r.report_id).filter(Boolean))];
+    const reasonIds = [...new Set(reports.map(r => r.reason_id).filter(Boolean))];
+
+    const jobs = jobIds.length
+      ? await Job.findAll({
+          where: { id: jobIds },
+          attributes: ['id', 'employer_id', 'status', 'job_profile_id'],
+          include: [{ model: JobProfile, as: 'JobProfile', attributes: ['id', 'profile_english'] }],
+          paranoid: false
+        })
+      : [];
+    const jobMap = new Map(jobs.map(j => [j.id, j]));
+
+    const employerIds = [...new Set(jobs.map(j => j.employer_id).filter(Boolean))];
+    const employers = employerIds.length
+      ? await Employer.findAll({
+          where: { id: employerIds },
+          attributes: ['id', 'name'],
+          paranoid: false
+        })
+      : [];
+    const employerMap = new Map(employers.map(e => [e.id, e]));
+
+    const reasons = reasonIds.length
+      ? await EmployerReportReason.findAll({
+          where: { id: reasonIds },
+          attributes: ['id', 'reason_english', 'reason_hindi'],
+          paranoid: false
+        })
+      : [];
+    const reasonMap = new Map(reasons.map(r => [r.id, r]));
+
+    const data = reports.map(r => {
+      const job = jobMap.get(r.report_id) || null;
+      const employer = job?.employer_id ? (employerMap.get(job.employer_id) || null) : null;
+      const reason = reasonMap.get(r.reason_id) || null;
+
+      return {
+        id: r.id,
+        report_type: r.report_type,
+
+        job_id: r.report_id,
+        job_name: job?.JobProfile?.profile_english || '-',   // UI expects job_name
+        job_status: job?.status || null,                     // NEW
+
+        employer_id: employer?.id || job?.employer_id || null,
+        employer_name: employer?.name || '-',                // UI expects employer_name
+
+        reason_english: reason?.reason_english || '-',
+        reason_hindi: reason?.reason_hindi || '',
+        description: r.description || '',
+        read_at: r.read_at,
+        created_at: r.created_at
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('[employees/:id/violations-reported] error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// NEW: expose both spellings (frontend currently tries both)
+router.get('/:id/voilations-reported', listEmployeeViolationsReported);
+router.get('/:id/violations-reported', listEmployeeViolationsReported);
+
+// NOTE: Vacancies in jobs UI is displayed as hired_total/no_vacancy (handled in /jobs routes + admin-web Jobs pages).
+// NOTE: employer/interviewer phone search + 12h shift timing are handled in backend/routes/jobs.js.
+// NOTE: shift timing / interviewer contact columns are implemented under /jobs listing, not employee routes.
+
+
+// ✅ MUST be before any routes that read req.body
+router.use(express.json({ limit: '1mb' }));
+router.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// ✅ MOVE these UP here (must be defined before route handlers reference them)
+async function fetchEmployeeWithUser(id) {
+  const employeeId = parseInt(id, 10);
+  if (!employeeId || Number.isNaN(employeeId)) return null;
+
+ 
+
+  return Employee.findByPk(employeeId, {
+    include: [{ model: User, as: 'User', paranoid: false }],
+    paranoid: false
+  });
+}
+
+async function ensureEmployeeUser(employee) {
+  if (!employee) return null;
+  if (employee.User) return employee.User;
+  if (!employee.user_id) return null;
+  return User.findByPk(employee.user_id, { paranoid: false });
+}
+
+// ✅ module.exports must be last
 module.exports = router;

@@ -1,7 +1,5 @@
 'use strict';
 
-const bcrypt = require('bcryptjs');
-
 module.exports = {
   async up(queryInterface, Sequelize) {
     const transaction = await queryInterface.sequelize.transaction();
@@ -36,11 +34,10 @@ module.exports = {
         { transaction }
       );
       if (!admins.length) {
-        const passwordHash = await bcrypt.hash('SuperAdmin@123', 10);
         await queryInterface.bulkInsert('admins', [{
           name: 'Super Admin',
           email: 'superadmin@rotijugaad.com',
-          password: passwordHash,
+          password: 'SuperAdmin@123',
           role: 'admin',
           role_id: superRoleId,
           is_active: true,

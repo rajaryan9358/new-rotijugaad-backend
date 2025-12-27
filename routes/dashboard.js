@@ -9,11 +9,14 @@ const { User, Employee, Employer } = models;
 const PaymentHistory = models.PaymentHistory || require('../models/PaymentHistory');
 const Referral = models.Referral || require('../models/Referral');
 const Report = models.Report || require('../models/Report');
-
+const CallHistory = models.CallHistory || require('../models/CallHistory');
 
 router.get('/', async (_req, res) => {
   try {
     const recentThreshold = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    const recentFromDate = recentThreshold.toISOString().slice(0, 10);
+    const recentToDate = new Date().toISOString().slice(0, 10);
+
     const [
       totalUsers,
       totalEmployees,
@@ -46,7 +49,23 @@ router.get('/', async (_req, res) => {
       newUsers,
       newEmployees,
       newEmployers,
-      newJobs
+      newJobs,
+
+      // NEW: payment history created in last 48h
+      newPaymentHistory,
+
+      // NEW: job interests created in last 48h
+      newJobInterests,
+
+      // NEW: CallHistory counts split by user_type
+      newEmployeeCallHistory,
+      newEmployerCallHistory,
+
+      // NEW: KYC verified employees in last 48h (based on kyc_verification_at) - powers Dashboard "Recent additions" card
+      newKycVerifiedEmployees,
+
+      // NEW: KYC verified employers in last 48h
+      newKycVerifiedEmployers
     ] = await Promise.all([
       User.count(),
       Employee.count(),
@@ -88,20 +107,42 @@ router.get('/', async (_req, res) => {
       Report.count({ where: { report_type: 'job' } }),
       Report.count({ where: { report_type: 'employee' } }),
       User.count({ where: { created_at: { [Op.gte]: recentThreshold } } }),
-      User.count({
+      User.count({ where: { user_type: 'employee', created_at: { [Op.gte]: recentThreshold } } }),
+      User.count({ where: { user_type: 'employer', created_at: { [Op.gte]: recentThreshold } } }),
+      Job.count({ where: { created_at: { [Op.gte]: recentThreshold } } }),
+
+      // NEW: payment history created in last 48h
+      PaymentHistory.count({ where: { created_at: { [Op.gte]: recentThreshold } } }),
+
+      // NEW
+      JobInterest.count({ where: { created_at: { [Op.gte]: recentThreshold } } }),
+
+      // NEW: Call history created in last 48h
+      CallHistory?.count
+        ? CallHistory.count({ where: { user_type: 'employee', created_at: { [Op.gte]: recentThreshold } } })
+        : 0,
+      CallHistory?.count
+        ? CallHistory.count({ where: { user_type: 'employer', created_at: { [Op.gte]: recentThreshold } } })
+        : 0,
+
+      // NEW: KYC verified employees in last 48h
+      Employee.count({
         where: {
-          user_type: 'employee',
-          created_at: { [Op.gte]: recentThreshold }
+          kyc_status: 'verified',
+          kyc_verification_at: { [Op.gte]: recentThreshold }
         }
       }),
-      User.count({
+
+      // NEW: KYC verified employers in last 48h
+      Employer.count({
         where: {
-          user_type: 'employer',
-          created_at: { [Op.gte]: recentThreshold }
+          kyc_status: 'verified',
+          kyc_verification_at: { [Op.gte]: recentThreshold }
         }
-      }),
-      Job.count({ where: { created_at: { [Op.gte]: recentThreshold } } })
+      })
     ]);
+
+    const newCallHistory = (Number(newEmployeeCallHistory) || 0) + (Number(newEmployerCallHistory) || 0);
 
     res.json({
       success: true,
@@ -137,7 +178,22 @@ router.get('/', async (_req, res) => {
         newUsers,
         newEmployees,
         newEmployers,
-        newJobs
+        newJobs,
+
+        // NEW
+        newPaymentHistory,
+        newJobInterests, // (was computed but not returned)
+
+        // NEW: Call history
+        newEmployeeCallHistory,
+        newEmployerCallHistory,
+        newCallHistory, // keep for compatibility
+
+        // NEW: recent KYC verified employees
+        newKycVerifiedEmployees,
+        newKycVerifiedEmployers, // NEW
+
+        recentWindow: { from: recentFromDate, to: recentToDate }
       }
     });
   } catch (error) {
@@ -148,5 +204,9 @@ router.get('/', async (_req, res) => {
     });
   }
 });
+
+// NOTE: Employer verification_at is separate from kyc_verification_at; dashboard recent KYC uses the latter.
+// NEW: KYC verified employees in last 48h (based on kyc_verification_at) - powers Dashboard "Recent additions" card
+// NEW: KYC verified employers in last 48h
 
 module.exports = router;

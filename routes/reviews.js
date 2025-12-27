@@ -35,13 +35,25 @@ const hydrateReviewerNames = async (rows) => {
   const employeeMap = new Map(employees.map((emp) => [emp.id, deriveName(emp)]));
   const employerMap = new Map(employers.map((emp) => [emp.id, deriveName(emp)]));
 
-  return rows.map((row) => ({
-    ...row.toJSON(),
-    reviewer_name:
+  return rows.map((row) => {
+    const json = row.toJSON();
+    const reviewer_name =
       row.user_type === 'employee'
         ? employeeMap.get(row.user_id) || '-'
-        : employerMap.get(row.user_id) || '-',
-  }));
+        : employerMap.get(row.user_id) || '-';
+
+    return {
+      ...json,
+      reviewer_name,
+      reviewer_entity_id: row.user_id,
+      reviewer_route:
+        row.user_id
+          ? (row.user_type === 'employee'
+              ? `/employees/${row.user_id}`
+              : `/employers/${row.user_id}`)
+          : null,
+    };
+  });
 };
 
 const buildFilters = (query) => {

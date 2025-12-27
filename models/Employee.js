@@ -12,6 +12,7 @@ const Employee = sequelize.define('Employee', {
   },
 
   name: { type: DataTypes.STRING, allowNull: true },
+  // NOTE: dob is used by admin-web to compute/display Age
   dob: { type: DataTypes.DATEONLY, allowNull: true },
   gender: { type: DataTypes.STRING, allowNull: true },
 
@@ -35,6 +36,14 @@ const Employee = sequelize.define('Employee', {
     type: DataTypes.INTEGER,
     allowNull: true,
     references: { model: 'cities', key: 'id' },
+  },
+
+  // Employee Job Profile (used in Call History Management - employer view)
+  // NOTE: Ensure DB column exists before relying on it. Until then, it's excluded by defaultScope below.
+  job_profile_id: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    references: { model: 'job_profiles', key: 'id' },
   },
 
   qualification_id: {
@@ -68,10 +77,17 @@ const Employee = sequelize.define('Employee', {
     allowNull: false,
     defaultValue: 'pending',
   },
+  verification_at: { type: DataTypes.DATE, allowNull: true },
+
   kyc_status: {
     type: DataTypes.ENUM('pending', 'verified', 'rejected'),
     allowNull: false,
     defaultValue: 'pending',
+  },
+  kyc_verification_at: {
+    type: DataTypes.DATE,
+    allowNull: true,
+    // Used by admin-web filters + dashboard deep-links: kyc_verified_from/to
   },
 
   // credit and subscription fields
@@ -112,6 +128,14 @@ const Employee = sequelize.define('Employee', {
   createdAt: 'created_at',
   updatedAt: 'updated_at',
   deletedAt: 'deleted_at',
+
+  // Avoid "Unknown column 'job_profile_id'" until DB migration is applied
+  defaultScope: {
+    attributes: { exclude: ['job_profile_id'] }
+  }
 });
+
+// NOTE: Employer model now also includes verification_at to match employee verification_at pattern.
+// NOTE: No changes required for status_change_by (tracked on users.status_change_by).
 
 module.exports = Employee;
