@@ -122,6 +122,20 @@ const endExclusiveOfDay = (d) => {
   return x;
 };
 
+// NEW: resolve job profile name for logs
+const getJobProfileLabel = async (jobProfileId) => {
+  if (!jobProfileId || !JobProfile) return null;
+  try {
+    const jp = await JobProfile.findByPk(jobProfileId, {
+      attributes: ['profile_english', 'profile_hindi'],
+      paranoid: false,
+    });
+    return jp ? (jp.profile_english || jp.profile_hindi || null) : null;
+  } catch {
+    return null;
+  }
+};
+
 /**
  * GET /jobs
  * Fetch a filtered list of jobs with related metadata.
@@ -554,7 +568,11 @@ router.post('/', async (req, res) => {
     // Deduct 1 ad credit for this job
     await employer.update({ ad_credit: remainingAd - 1 }, { transaction: t });
 
-    const job = await Job.create(buildJobAttributes(req.body), { transaction: t });
+    const job = await Job.create({
+      ...buildJobAttributes(req.body),
+      status: 'inactive',
+      expired_at: null
+    }, { transaction: t });
 
     // 2. Save JobSkills
     if (Array.isArray(skills)) {
@@ -608,11 +626,12 @@ router.post('/', async (req, res) => {
     await t.commit();
 
     const adminId = getAdminId(req);
+    const jobProfileLabel = await getJobProfileLabel(job.job_profile_id);
     await safeCreateLog({
       category: 'jobs',
       type: 'add',
       redirect_to: `/jobs/${job.id}`,
-      log_text: `Created job: #${job.id} employer_id=${job.employer_id || '-'} job_profile_id=${job.job_profile_id || '-'} status=${job.status || '-'}`,
+      log_text: `Created job: #${job.id} profile=${jobProfileLabel || '-'} status=${job.status || '-'}`,
       rj_employee_id: adminId,
     });
 
@@ -818,11 +837,12 @@ router.put('/:id', async (req, res) => {
     await t.commit();
 
     const adminId = getAdminId(req);
+    const jobProfileLabel = await getJobProfileLabel(job.job_profile_id);
     await safeCreateLog({
       category: 'jobs',
       type: 'update',
       redirect_to: `/jobs/${job.id}`,
-      log_text: `Updated job: #${job.id} employer_id=${job.employer_id || '-'} job_profile_id=${job.job_profile_id || '-'} status=${job.status || '-'}`,
+      log_text: `Updated job: #${job.id} profile=${jobProfileLabel || '-'} status=${job.status || '-'}`,
       rj_employee_id: adminId,
     });
 
@@ -875,11 +895,12 @@ router.patch('/:id/status', async (req, res) => {
       : nextStatus === 'active'
         ? 'Activated job'
         : 'Deactivated job';
+    const jobProfileLabel = await getJobProfileLabel(job.job_profile_id);
     await safeCreateLog({
       category: 'jobs',
       type: 'update',
       redirect_to: `/jobs/${job.id}`,
-      log_text: `${actionLabel}: #${job.id} (from ${prevStatus || '-'}${prevExpiredAt ? ' expired' : ''} to ${job.status || '-' }${job.expired_at ? ' expired' : ''})`,
+      log_text: `${actionLabel}: #${job.id} profile=${jobProfileLabel || '-'} (from ${prevStatus || '-'}${prevExpiredAt ? ' expired' : ''} to ${job.status || '-' }${job.expired_at ? ' expired' : ''})`,
       rj_employee_id: adminId,
     });
 
@@ -910,11 +931,12 @@ router.patch('/:id/verification-status', async (req, res) => {
 
     const adminId = getAdminId(req);
     const actionLabel = next === 'approved' ? 'Approved job' : next === 'rejected' ? 'Rejected job' : 'Set job verification pending';
+    const jobProfileLabel = await getJobProfileLabel(job.job_profile_id);
     await safeCreateLog({
       category: 'jobs',
       type: 'update',
       redirect_to: `/jobs/${job.id}`,
-      log_text: `${actionLabel}: #${job.id} (from ${prev || '-'} to ${next})`,
+      log_text: `${actionLabel}: #${job.id} profile=${jobProfileLabel || '-'} (from ${prev || '-'} to ${next})`,
       rj_employee_id: adminId,
     });
 
@@ -962,11 +984,12 @@ router.delete('/:id', async (req, res) => {
     await t.commit();
 
     const adminId = getAdminId(req);
+    const jobProfileLabel = await getJobProfileLabel(job.job_profile_id);
     await safeCreateLog({
       category: 'jobs',
       type: 'delete',
       redirect_to: '/jobs',
-      log_text: `Deleted job: #${job.id} employer_id=${job.employer_id || '-'} job_profile_id=${job.job_profile_id || '-'} status=${job.status || '-'}`,
+      log_text: `Deleted job: #${job.id} profile=${jobProfileLabel || '-'} status=${job.status || '-'}`,
       rj_employee_id: adminId,
     });
 

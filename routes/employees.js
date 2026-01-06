@@ -45,6 +45,7 @@ const Report = require('../models/Report'); // NEW
 const getAdminId = require('../utils/getAdminId');
 const Admin = require('../models/Admin'); // NEW: join status_change_by -> admins.name
 const Log = require('../models/Log');
+const ManualCreditHistory = require('../models/ManualCreditHistory');
 
 const { authenticate } = require('../middleware/auth');
 
@@ -97,6 +98,14 @@ const safeLog = async (req, { category, type, redirect_to, log_text }) => {
     log_text: log_text || null,
     rj_employee_id: getAdminId(req),
   });
+};
+
+const safeCreateManualCreditHistory = async (payload) => {
+  try {
+    await ManualCreditHistory.create(payload);
+  } catch (e) {
+    // never break main flows for history writes
+  }
 };
 
 const pickEmployeePayload = (body = {}) => ({
@@ -498,6 +507,22 @@ router.post('/', authenticate, async (req, res) => {
           err.status = 404;
           throw err;
         }
+
+        const existingType = (user.user_type || '').toString().toLowerCase();
+        if (user.profile_completed_at) {
+          const err = new Error('Mobile already exist');
+          err.status = 409;
+          throw err;
+        }
+        if (existingType && existingType !== 'employee') {
+          const err = new Error('Mobile already exist');
+          err.status = 409;
+          throw err;
+        }
+        if (user.deleted_at) {
+          await user.restore({ transaction: t });
+        }
+
         const existing = await Employee.findOne({ where: { user_id: user.id }, transaction: t, paranoid: false });
         if (existing) {
           const err = new Error('Employee record already exists for this user');
@@ -515,8 +540,50 @@ router.post('/', authenticate, async (req, res) => {
           err.status = 400;
           throw err;
         }
-        user = await User.create({ mobile, name, user_type: 'employee' }, { transaction: t });
-        createdUser = user;
+
+        // Enforce: mobile must be unique unless the existing user is the same type
+        // and has not completed their profile yet.
+        user = await User.findOne({ where: { mobile }, transaction: t, paranoid: false });
+        if (user) {
+          const existingType = (user.user_type || '').toString().toLowerCase();
+          const profileCompletedAt = user.profile_completed_at;
+
+          if (profileCompletedAt) {
+            const err = new Error('Mobile already exist');
+            err.status = 409;
+            throw err;
+          }
+
+          if (existingType && existingType !== 'employee') {
+            const err = new Error('Mobile already exist');
+            err.status = 409;
+            throw err;
+          }
+
+          if (user.deleted_at) {
+            await user.restore({ transaction: t });
+          }
+
+          const existingEmp = await Employee.findOne({ where: { user_id: user.id }, transaction: t, paranoid: false });
+          if (existingEmp) {
+            const err = new Error('Employee record already exists for this user');
+            err.status = 400;
+            throw err;
+          }
+
+          const userUpdates = {};
+          if (!user.user_type) userUpdates.user_type = 'employee';
+          if (name && (!user.name || !user.name.toString().trim())) userUpdates.name = name;
+          if (Object.keys(userUpdates).length) await user.update(userUpdates, { transaction: t });
+        } else {
+          user = await User.create({ mobile, name, user_type: 'employee' }, { transaction: t });
+          createdUser = user;
+        }
+      }
+
+      // Stamp when the employee/employer profile is created (used to prevent re-using the same mobile once a profile exists)
+      if (user && !user.profile_completed_at) {
+        await user.update({ profile_completed_at: new Date() }, { transaction: t });
       }
 
       const empPayload = pickEmployeePayload(req.body);
@@ -563,16 +630,30 @@ router.put('/:id', authenticate, async (req, res) => {
       }
 
       beforeName = employee.name;
+      // Stamp when the employee/employer profile is created (used to prevent re-using the same mobile once a profile exists)
+      if (user && !user.profile_completed_at) {
+        await user.update({ profile_completed_at: new Date() }, { transaction: t });
+      }
+
       const empPayload = pickEmployeePayload(req.body);
       if (typeof req.body?.name === 'string' && req.body.name.trim()) empPayload.name = req.body.name.trim();
       await employee.update(empPayload, { transaction: t });
-
       const mobile = (req.body?.mobile || '').toString().trim();
       const name = (req.body?.name || '').toString().trim();
       const user = await User.findByPk(employee.user_id, { transaction: t, paranoid: false });
       if (user) {
         const userUpdates = {};
-        if (mobile && mobile !== user.mobile) userUpdates.mobile = mobile;
+
+        if (mobile && mobile !== user.mobile) {
+          const existingMobileUser = await User.findOne({ where: { mobile }, transaction: t, paranoid: false });
+          if (existingMobileUser && existingMobileUser.id !== user.id) {
+            const err = new Error('Mobile already exist');
+            err.status = 409;
+            throw err;
+          }
+          userUpdates.mobile = mobile;
+        }
+
         if (name && name !== user.name) userUpdates.name = name;
         if (Object.keys(userUpdates).length) await user.update(userUpdates, { transaction: t });
       }
@@ -664,14 +745,14 @@ router.post('/:id/change-subscription', authenticate, async (req, res) => {
       category: 'employee subscription',
       type: 'update',
       redirect_to: employeeRedirect(employee.id),
-      log_text: `Employee subscription changed: #${employee.id} plan_id=${plan.id}, expiry=${expiryAt ? expiryAt.toISOString() : '-'}`,
+      log_text: `Employee subscription changed: #${employee.id} plan=${plan.plan_name_english || plan.plan_name_hindi || plan.id}, expiry=${expiryAt ? expiryAt.toISOString() : '-'}`,
     });
 
     await safeLog(req, {
       category: 'employee',
       type: 'update',
       redirect_to: employeeRedirect(employee.id),
-      log_text: `Employee subscription changed (employee log): #${employee.id} plan_id=${plan.id}`,
+      log_text: `Employee subscription changed (employee log): #${employee.id} plan=${plan.plan_name_english || plan.plan_name_hindi || plan.id}`,
     });
 
     return res.json({
@@ -706,6 +787,16 @@ router.post('/:id/add-credits', authenticate, async (req, res) => {
     if (req.body?.credit_expiry_at) updatePayload.credit_expiry_at = req.body.credit_expiry_at;
 
     await employee.update(updatePayload);
+
+    await safeCreateManualCreditHistory({
+      user_type: 'employee',
+      user_id: employee.id,
+      contact_credit: Math.max(contactDelta, 0),
+      interest_credit: Math.max(interestDelta, 0),
+      ad_credit: 0,
+      expiry_date: req.body?.credit_expiry_at || null,
+      admin_id: getAdminId(req) || null,
+    });
 
     await safeLog(req, {
       category: 'employee subscription',
@@ -1057,14 +1148,14 @@ router.post('/:id/documents/upload', docUpload.single('file'), async (req, res) 
       category: 'document',
       type: 'update',
       redirect_to: employeeRedirect(emp.id),
-      log_text: `Employee document uploaded (${type}): #${emp.id} ${emp.name || '-'}`,
+      log_text: `Employee document uploaded: #${emp.id} ${emp.name || "-"} type=${type === "resume" ? "Resume" : type === "driving_license" ? "Driving License" : type === "other" ? "Other" : type} title=${req.file?.originalname || "-"}`
     });
 
     await safeLog(req, {
       category: 'employee',
       type: 'update',
       redirect_to: employeeRedirect(emp.id),
-      log_text: `Employee document updated (employee log): #${emp.id} (${type})`,
+      log_text: `Employee document updated (employee log): #${emp.id} ${emp.name || "-"} type=${type === "resume" ? "Resume" : type === "driving_license" ? "Driving License" : type === "other" ? "Other" : type} title=${req.file?.originalname || "-"}`
     });
     res.json({ success:true, data: doc });
   } catch (e) {
@@ -1097,14 +1188,14 @@ router.delete('/:id/documents/:docId', async (req, res) => {
       category: 'document',
       type: 'delete',
       redirect_to: employeeRedirect(employeeId),
-      log_text: `Employee document deleted: employee #${employeeId} doc #${docId}`,
+      log_text: `Employee document deleted: #${employeeId} ${emp.name || "-"} type=${doc.document_type === "resume" ? "Resume" : doc.document_type === "driving_license" ? "Driving License" : doc.document_type === "other" ? "Other" : doc.document_type} title=${doc.document_name || "-"}`
     });
 
     await safeLog(req, {
       category: 'employee',
       type: 'update',
       redirect_to: employeeRedirect(employeeId),
-      log_text: `Employee document deleted (employee log): #${employeeId} doc #${docId}`,
+      log_text: `Employee document deleted (employee log): #${employeeId} ${emp.name || "-"} type=${doc.document_type === "resume" ? "Resume" : doc.document_type === "driving_license" ? "Driving License" : doc.document_type === "other" ? "Other" : doc.document_type} title=${doc.document_name || "-"}`
     });
 
     return res.json({ success: true, message: 'Deleted' });
@@ -1182,8 +1273,8 @@ router.post('/:id/job-profiles', authenticate, async (req, res) => {
     if (ids.length === 0) {
       await EmployeeJobProfile.destroy({ where: { employee_id: employeeId } });
       await safeLog(req, {
-        category: 'employee',
-        type: 'update',
+        category: "employee",
+        type: "update",
         redirect_to: employeeRedirect(employeeId),
         log_text: `Employee job profiles updated: #${employeeId} cleared`,
       });
@@ -1254,7 +1345,7 @@ router.post('/:id/job-profiles', authenticate, async (req, res) => {
       category: 'employee',
       type: 'update',
       redirect_to: employeeRedirect(employeeId),
-      log_text: `Employee job profiles updated: #${employeeId} -> [${ids.join(', ')}]`,
+      log_text: `Employee job profiles updated: #${employeeId} -> [${foundProfiles.map(p => (p.profile_english || p.profile_hindi || p.id)).join(", ")}]`
     });
     res.json({ success: true, data: rows });
   } catch (err) {
@@ -1369,14 +1460,14 @@ router.put('/:id/experiences/:expId', async (req, res) => {
       category: 'experience',
       type: 'update',
       redirect_to: employeeRedirect(emp.id),
-      log_text: `Experience updated: employee #${emp.id} exp #${exp.id}`,
+      log_text: `Experience updated: employee #${emp.id} (${emp.name || '-'}) firm=${exp.previous_firm || '-'}`,
     });
 
     await safeLog(req, {
       category: 'employee',
       type: 'update',
       redirect_to: employeeRedirect(emp.id),
-      log_text: `Experience updated (employee log): employee #${emp.id} exp #${exp.id}`,
+      log_text: `Experience updated (employee log): employee #${emp.id} (${emp.name || '-'}) firm=${exp.previous_firm || '-'}`,
     });
     res.json({ success:true, data: exp });
   } catch (e) {
@@ -1402,14 +1493,14 @@ router.delete('/:id/experiences/:expId', async (req, res) => {
       category: 'experience',
       type: 'delete',
       redirect_to: employeeRedirect(emp.id),
-      log_text: `Experience deleted: employee #${emp.id} exp #${req.params.expId}`,
+      log_text: `Experience deleted: employee #${emp.id} (${emp.name || '-'}) firm=${exp.previous_firm || '-'}`,
     });
 
     await safeLog(req, {
       category: 'employee',
       type: 'update',
       redirect_to: employeeRedirect(emp.id),
-      log_text: `Experience deleted (employee log): employee #${emp.id} exp #${req.params.expId}`,
+      log_text: `Experience deleted (employee log): employee #${emp.id} (${emp.name || '-'}) firm=${exp.previous_firm || '-'}`,
     });
     res.json({ success:true, message:'Deleted' });
   } catch (e) {
@@ -1854,7 +1945,48 @@ router.get('/:id/credit-history', async (req, res) => {
     res.json({ success: true, data: [...contactData, ...interestData] });
   } catch (err) {
     console.error('[employees/:id/credit-history] error:', err);
-    res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * GET /employees/:id/manual-credit-history
+ * List manual credits added by admins.
+ */
+router.get('/:id/manual-credit-history', authenticate, async (req, res) => {
+  try {
+    const employeeId = parseInt(req.params.id, 10);
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
+
+    const rows = await ManualCreditHistory.findAll({
+      where: { user_type: 'employee', user_id: employeeId },
+      order: [['created_at', 'DESC']],
+      limit: 500,
+    });
+
+    const adminIds = [...new Set(rows.map((r) => r.admin_id).filter(Boolean))];
+    const admins = adminIds.length
+      ? await Admin.findAll({ where: { id: adminIds }, attributes: ['id', 'name'], paranoid: false })
+      : [];
+    const adminMap = new Map(admins.map((a) => [a.id, a.name]));
+
+    const data = rows.map((r) => ({
+      id: r.id,
+      user_type: r.user_type,
+      user_id: r.user_id,
+      contact_credit: r.contact_credit,
+      interest_credit: r.interest_credit,
+      ad_credit: r.ad_credit,
+      expiry_date: r.expiry_date,
+      admin_id: r.admin_id,
+      admin_name: r.admin_id ? (adminMap.get(r.admin_id) || null) : null,
+      created_at: r.created_at,
+    }));
+
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error('[employees/:id/manual-credit-history] error:', err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 

@@ -3,6 +3,8 @@ const { Op } = require('sequelize');
 const Review = require('../models/Review');
 const Employee = require('../models/Employee');
 const Employer = require('../models/Employer');
+const Log = require('../models/Log');
+const getAdminId = require('../utils/getAdminId');
 
 
 const MAX_LIMIT = 100;
@@ -18,6 +20,19 @@ const deriveName = (entity) => {
     [entity.first_name, entity.last_name].filter(Boolean).join(' '),
   ].find((value) => value && value.trim());
   return fallback?.trim() || '-';
+};
+
+const safeLog = async (req, payload) => {
+  try {
+    const adminId = getAdminId(req);
+    if (!adminId) return;
+    await Log.create({
+      ...payload,
+      rj_employee_id: adminId,
+    });
+  } catch (e) {
+    // never break main flows for logging
+  }
 };
 
 const hydrateReviewerNames = async (rows) => {
@@ -151,6 +166,19 @@ router.patch('/:id/read', async (req, res) => {
     if (!review.read_at) {
       review.read_at = new Date();
       await review.save();
+
+      const reviewer =
+        review.user_type === 'employee'
+          ? await Employee.findByPk(review.user_id, { paranoid: false })
+          : await Employer.findByPk(review.user_id, { paranoid: false });
+      const reviewerName = deriveName(reviewer);
+
+      await safeLog(req, {
+        category: 'reviews',
+        type: 'update',
+        redirect_to: '/reviews',
+        log_text: `Review marked read: #${review.id} reviewer=${reviewerName} (${review.user_type || '-'}) rating=${review.rating ?? '-'}`
+      });
     }
     res.json({ success: true, data: review });
   } catch (error) {

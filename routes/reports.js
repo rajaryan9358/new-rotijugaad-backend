@@ -383,11 +383,69 @@ const markReadHandler = async (req, res) => {
           ? `/jobs/${row.report_id}`
           : null;
 
+      let reasonLabel = null;
+      if (row.reason_id) {
+        try {
+          if (reportType === 'job' && EmployerReportReason) {
+            const reason = await EmployerReportReason.findByPk(row.reason_id, {
+              attributes: ['reason_english', 'reason_hindi'],
+              paranoid: false,
+            });
+            reasonLabel = reason ? (reason.reason_english || reason.reason_hindi || null) : null;
+          } else if (reportType === 'employee' && EmployeeReportReason) {
+            const reason = await EmployeeReportReason.findByPk(row.reason_id, {
+              attributes: ['reason_english', 'reason_hindi'],
+              paranoid: false,
+            });
+            reasonLabel = reason ? (reason.reason_english || reason.reason_hindi || null) : null;
+          }
+        } catch {
+          // ignore lookup failures
+        }
+      }
+
+      let reporterLabel = null;
+      let reportedLabel = null;
+      let jobProfileLabel = null;
+      let employerLabel = null;
+
+      try {
+        if (reportType === 'job') {
+          if (Employee && row.user_id) {
+            const emp = await Employee.findByPk(row.user_id, { attributes: ['name'], paranoid: false });
+            reporterLabel = emp?.name || null;
+          }
+          if (Job && row.report_id) {
+            const job = await Job.findByPk(row.report_id, { attributes: ['job_profile_id', 'employer_id'], paranoid: false });
+            if (job?.job_profile_id && JobProfile) {
+              const jp = await JobProfile.findByPk(job.job_profile_id, { attributes: ['profile_english', 'profile_hindi'], paranoid: false });
+              jobProfileLabel = jp ? (jp.profile_english || jp.profile_hindi || null) : null;
+            }
+          }
+          if (job?.employer_id && Employer) {
+            const employer = await Employer.findByPk(job.employer_id, { attributes: ['name', 'organization_name'], paranoid: false });
+            employerLabel = employer ? (employer.name || employer.organization_name || null) : null;
+          }
+          reportedLabel = jobProfileLabel;
+        } else if (reportType === 'employee') {
+          if (Employer && row.user_id) {
+            const emp = await Employer.findByPk(row.user_id, { attributes: ['name'], paranoid: false });
+            reporterLabel = emp?.name || null;
+          }
+          if (Employee && row.report_id) {
+            const employee = await Employee.findByPk(row.report_id, { attributes: ['name'], paranoid: false });
+            reportedLabel = employee?.name || null;
+          }
+        }
+      } catch {
+        // ignore lookup failures
+      }
+
       await safeCreateLog({
         category: 'voilation reports',
         type: 'update',
         redirect_to: redirectTo,
-        log_text: `Report marked read: #${row.id} report_type=${row.report_type} report_id=${row.report_id}`,
+        log_text: `Report marked read: ${reasonLabel || '-'}; reporter=${reporterLabel || '-'}; reported=${reportedLabel || '-'}`,
         rj_employee_id: adminId,
       });
 
@@ -396,17 +454,27 @@ const markReadHandler = async (req, res) => {
           category: 'employee',
           type: 'update',
           redirect_to: redirectTo,
-          log_text: `Employee violation report marked read: employee #${row.report_id} report #${row.id}`,
+          log_text: `Employee violation report marked read: ${reasonLabel || '-'}; reporter=${reporterLabel || '-'}; employee=${reportedLabel || '-'}`,
           rj_employee_id: adminId,
         });
       }
 
       if (reportType === 'job') {
+        if (row.user_id) {
+          await safeCreateLog({
+            category: 'employee',
+            type: 'update',
+            redirect_to: `/employees/${row.user_id}`,
+            log_text: `Employee job violation report marked read: ${reasonLabel || '-'}; employer=${employerLabel || '-'}; job_profile=${jobProfileLabel || '-'}`,
+            rj_employee_id: adminId,
+          });
+        }
+
         await safeCreateLog({
           category: 'jobs',
           type: 'update',
           redirect_to: redirectTo,
-          log_text: `Job violation report marked read: job #${row.report_id} report #${row.id}`,
+          log_text: `Job violation report marked read: ${reasonLabel || '-'}; reporter=${reporterLabel || '-'}; employer=${employerLabel || '-'}; job_profile=${jobProfileLabel || '-'}`,
           rj_employee_id: adminId,
         });
 
@@ -418,7 +486,7 @@ const markReadHandler = async (req, res) => {
               category: 'employer',
               type: 'update',
               redirect_to: `/employers/${employerId}`,
-              log_text: `Employer violation report marked read: employer #${employerId} report #${row.id} job #${row.report_id}`,
+              log_text: `Employer violation report marked read: ${reasonLabel || '-'}; reporter=${reporterLabel || '-'}; employer=${employerLabel || '-'}; job_profile=${jobProfileLabel || '-'}`,
               rj_employee_id: adminId,
             });
           }
@@ -455,11 +523,66 @@ router.delete('/:id', async (req, res) => {
     await row.destroy();
 
     const adminId = getAdminId(req);
+    const reportType = (row.report_type || '').toString().toLowerCase();
+
+    let reasonLabel = null;
+    try {
+      if (row.reason_id) {
+        if (reportType === 'job' && EmployerReportReason) {
+          const reason = await EmployerReportReason.findByPk(row.reason_id, {
+            attributes: ['reason_english', 'reason_hindi'],
+            paranoid: false,
+          });
+          reasonLabel = reason ? (reason.reason_english || reason.reason_hindi || null) : null;
+        } else if (reportType === 'employee' && EmployeeReportReason) {
+          const reason = await EmployeeReportReason.findByPk(row.reason_id, {
+            attributes: ['reason_english', 'reason_hindi'],
+            paranoid: false,
+          });
+          reasonLabel = reason ? (reason.reason_english || reason.reason_hindi || null) : null;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    let reporterLabel = null;
+    let reportedLabel = null;
+    let jobProfileLabel = null;
+
+    try {
+      if (reportType === 'job') {
+        if (Employee && row.user_id) {
+          const emp = await Employee.findByPk(row.user_id, { attributes: ['name'], paranoid: false });
+          reporterLabel = emp?.name || null;
+        }
+        if (Job && row.report_id) {
+          const job = await Job.findByPk(row.report_id, { attributes: ['job_profile_id', 'employer_id'], paranoid: false });
+          if (job?.job_profile_id && JobProfile) {
+            const jp = await JobProfile.findByPk(job.job_profile_id, { attributes: ['profile_english', 'profile_hindi'], paranoid: false });
+            jobProfileLabel = jp ? (jp.profile_english || jp.profile_hindi || null) : null;
+          }
+        }
+        reportedLabel = jobProfileLabel;
+      } else if (reportType === 'employee') {
+        if (Employer && row.user_id) {
+          const emp = await Employer.findByPk(row.user_id, { attributes: ['name'], paranoid: false });
+          reporterLabel = emp?.name || null;
+        }
+        if (Employee && row.report_id) {
+          const employee = await Employee.findByPk(row.report_id, { attributes: ['name'], paranoid: false });
+          reportedLabel = employee?.name || null;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
     await safeCreateLog({
       category: 'voilation reports',
       type: 'delete',
       redirect_to: '/violation-reports',
-      log_text: `Deleted report: #${row.id} report_type=${row.report_type} report_id=${row.report_id} user_id=${row.user_id}`,
+      log_text: `Deleted report: ${reasonLabel || '-'}; reporter=${reporterLabel || '-'}; reported=${reportedLabel || '-'}`,
       rj_employee_id: adminId,
     });
 

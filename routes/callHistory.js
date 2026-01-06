@@ -472,11 +472,32 @@ router.put('/:id/read', authenticate, async (req, res) => {
       const redirectTo = isEmployee ? `/employees/${row.user_id}` : `/employers/${row.user_id}`;
       const category = isEmployee ? 'employee call experience' : 'employer call experience';
 
+      let userLabel = null;
+      let calledLabel = null;
+      try {
+        if (isEmployee) {
+          const emp = Employee ? await Employee.findByPk(row.user_id, { attributes: ['name'], paranoid: false }) : null;
+          userLabel = emp?.name || null;
+
+          const job = Job && row.called_id ? await Job.findByPk(row.called_id, { attributes: ['employer_id'], paranoid: false }) : null;
+          const employer = Employer && job?.employer_id ? await Employer.findByPk(job.employer_id, { attributes: ['name', 'organization_name'], paranoid: false }) : null;
+          calledLabel = employer ? (employer.name || employer.organization_name || null) : null;
+        } else {
+          const employer = Employer ? await Employer.findByPk(row.user_id, { attributes: ['name', 'organization_name'], paranoid: false }) : null;
+          userLabel = employer ? (employer.name || employer.organization_name || null) : null;
+
+          const calledEmp = Employee && row.called_id ? await Employee.findByPk(row.called_id, { attributes: ['name'], paranoid: false }) : null;
+          calledLabel = calledEmp?.name || null;
+        }
+      } catch {
+        // ignore lookup failures
+      }
+
       await safeCreateLog({
         category: 'call history',
         type: 'update',
         redirect_to: '/call-history',
-        log_text: `Call history marked read: #${row.id} ${row.user_type}#${row.user_id} called_id=${row.called_id || '-'} call_experience_id=${row.call_experience_id || '-'}`,
+        log_text: `Call history marked read: ${isEmployee ? 'employee' : 'employer'}=${userLabel || row.user_id} called=${calledLabel || '-'}`,
         rj_employee_id: adminId,
       });
 
@@ -485,7 +506,7 @@ router.put('/:id/read', authenticate, async (req, res) => {
         category,
         type: 'update',
         redirect_to: redirectTo,
-        log_text: `Call history marked read: #${row.id} ${row.user_type}#${row.user_id} call_experience_id=${row.call_experience_id || '-'}`,
+        log_text: `Call history marked read: ${isEmployee ? 'employee' : 'employer'}=${userLabel || row.user_id} called=${calledLabel || '-'}`,
         rj_employee_id: adminId,
       });
 
@@ -495,7 +516,7 @@ router.put('/:id/read', authenticate, async (req, res) => {
           category: 'employee',
           type: 'update',
           redirect_to: redirectTo,
-          log_text: `Employee call experience marked read: employee #${row.user_id} call_history #${row.id}`,
+          log_text: `Employee call experience marked read: employee=${userLabel || row.user_id} employer=${calledLabel || '-'}`,
           rj_employee_id: adminId,
         });
       } else {
@@ -503,7 +524,7 @@ router.put('/:id/read', authenticate, async (req, res) => {
           category: 'employer',
           type: 'update',
           redirect_to: redirectTo,
-          log_text: `Employer call experience marked read: employer #${row.user_id} call_history #${row.id}`,
+          log_text: `Employer call experience marked read: employer=${userLabel || row.user_id} employee=${calledLabel || '-'}`,
           rj_employee_id: adminId,
         });
       }

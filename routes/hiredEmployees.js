@@ -68,28 +68,32 @@ router.get('/', async (req, res) => {
         replacements.createdToExclusive = `${ymdExclusive} 00:00:00`;
       }
     }
-
     if (search) {
       const loweredLike = `%${search.toLowerCase()}%`;
-      filters.push(`(
-        LOWER(COALESCE(e.name,'')) LIKE :searchLower
-        OR LOWER(COALESCE(eu.mobile,'')) LIKE :searchRaw
-        OR LOWER(COALESCE(er.name,'')) LIKE :searchLower
-        OR LOWER(COALESCE(uer.mobile,'')) LIKE :searchRaw
-        OR LOWER(COALESCE(jp.profile_english,'')) LIKE :searchLower
-        OR LOWER(COALESCE(jp.profile_hindi,'')) LIKE :searchLower
-        OR LOWER(COALESCE(j.description_english,'')) LIKE :searchLower
-        OR LOWER(COALESCE(j.description_hindi,'')) LIKE :searchLower
-        OR LOWER(COALESCE(je.organization_name,'')) LIKE :searchLower
-      )`);
-      replacements.searchLower = loweredLike;
-      replacements.searchRaw = `%${search}%`;
+      const searchRaw = `%${search}%`;
+
+      const orParts = [
+        "LOWER(COALESCE(e.name,'')) LIKE :searchLower",
+        "COALESCE(eu.mobile,'') LIKE :searchRaw",
+        "LOWER(COALESCE(er.name,'')) LIKE :searchLower",
+        "COALESCE(uer.mobile,'') LIKE :searchRaw",
+        "LOWER(COALESCE(jp.profile_english,'')) LIKE :searchLower",
+        "LOWER(COALESCE(jp.profile_hindi,'')) LIKE :searchLower",
+        "LOWER(COALESCE(j.description_english,'')) LIKE :searchLower",
+        "LOWER(COALESCE(j.description_hindi,'')) LIKE :searchLower",
+        "LOWER(COALESCE(je.organization_name,'')) LIKE :searchLower",
+        "COALESCE(j.interviewer_contact,'') LIKE :searchRaw"
+      ];
 
       const numericSearch = Number(search);
       if (!Number.isNaN(numericSearch)) {
-        filters.push('(ji.id = :searchNum OR e.id = :searchNum OR er.id = :searchNum OR j.id = :searchNum)');
+        orParts.push('ji.id = :searchNum', 'e.id = :searchNum', 'er.id = :searchNum', 'j.id = :searchNum');
         replacements.searchNum = numericSearch;
       }
+
+      filters.push('(' + orParts.join(' OR ') + ')');
+      replacements.searchLower = loweredLike;
+      replacements.searchRaw = searchRaw;
     }
 
     const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';

@@ -23,6 +23,7 @@ const { deleteByEmployerId } = require('../utils/deleteUserTransactional');
 const Referral = require('../models/Referral'); // added
 const getAdminId = require('../utils/getAdminId');
 const Log = require('../models/Log');
+const ManualCreditHistory = require('../models/ManualCreditHistory');
 
 const { authenticate } = require('../middleware/auth');
 
@@ -38,6 +39,14 @@ const safeLog = async (req, payload) => {
     });
   } catch (e) {
     // never break main flows for logging
+  }
+};
+
+const safeCreateManualCreditHistory = async (payload) => {
+  try {
+    await ManualCreditHistory.create(payload);
+  } catch (e) {
+    // never break main flows for history writes
   }
 };
 
@@ -289,7 +298,15 @@ router.get('/', async (req, res) => {
       include,
       order: [[sortField, sortDir]],
       distinct: true,
-      paranoid: true
+      paranoid: true,
+      attributes: {
+        include: [
+          [
+            literal("(SELECT COUNT(1) FROM jobs j WHERE j.employer_id = Employer.id AND j.deleted_at IS NULL AND j.expired_at IS NULL AND j.status = 'active')"),
+            'active_jobs_count'
+          ]
+        ]
+      }
     };
     if (!fetchAll) {
       queryOptions.limit = limit;
@@ -360,17 +377,44 @@ router.post('/', authenticate, async (req, res) => {
     if (userId) {
       user = await User.findByPk(userId, { paranoid: false });
       if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+      const existingType = (user.user_type || '').toString().toLowerCase();
+      if (user.profile_completed_at) {
+        return res.status(409).json({ success: false, message: 'Mobile already exist' });
+      }
+      if (existingType && existingType !== 'employer') {
+        return res.status(409).json({ success: false, message: 'Mobile already exist' });
+      }
+
       if (mobile && user.mobile !== mobile) await user.update({ mobile });
       if (!user.user_type) await user.update({ user_type: 'employer' });
+
+      const existingEmployer = await Employer.findOne({ where: { user_id: user.id }, paranoid: false });
+      if (existingEmployer) {
+        return res.status(400).json({ success: false, message: 'Employer record already exists for this user' });
+      }
     } else {
       if (!mobile) return res.status(400).json({ success: false, message: 'mobile is required when user is not pre-selected' });
       user = await User.findOne({ where: { mobile }, paranoid: false });
       if (!user) {
         user = await User.create({ mobile, name: name || null, user_type: 'employer' });
       } else {
+        const existingType = (user.user_type || '').toString().toLowerCase();
+        if (user.profile_completed_at) {
+          return res.status(409).json({ success: false, message: 'Mobile already exist' });
+        }
+        if (existingType && existingType !== 'employer') {
+          return res.status(409).json({ success: false, message: 'Mobile already exist' });
+        }
+        if (user.deleted_at) await user.restore();
         if (!user.user_type) await user.update({ user_type: 'employer' });
       }
       userId = user.id;
+
+      const existingEmployer = await Employer.findOne({ where: { user_id: userId }, paranoid: false });
+      if (existingEmployer) {
+        return res.status(400).json({ success: false, message: 'Employer record already exists for this user' });
+      }
     }
 
     const attrs = stripUndefined(buildEmployerAttributes(body));
@@ -378,6 +422,12 @@ router.post('/', authenticate, async (req, res) => {
     attrs.name = name;
 
     const employer = await Employer.create(attrs);
+
+    // Stamp when the employer profile is created.
+    if (user && !user.profile_completed_at) {
+      await user.update({ profile_completed_at: new Date() });
+    }
+
 
     const include = [...baseInclude];
     ensureUserInclude(include);
@@ -392,8 +442,9 @@ router.post('/', authenticate, async (req, res) => {
 
     res.status(201).json({ success: true, data: created });
   } catch (err) {
+    const status = err?.status && Number.isFinite(err.status) ? err.status : 500;
     console.error('[employers] create error:', err);
-    res.status(500).json({ success: false, message: err.message || 'Failed to create employer' });
+    res.status(status).json({ success: false, message: err.message || 'Failed to create employer' });
   }
 });
 
@@ -413,7 +464,13 @@ router.put('/:id', authenticate, async (req, res) => {
     const mobile = String(body.mobile || '').trim();
     if (mobile) {
       const user = await User.findByPk(employer.user_id, { paranoid: false });
-      if (user) await user.update({ mobile });
+      if (user && mobile !== user.mobile) {
+        const existingMobileUser = await User.findOne({ where: { mobile }, paranoid: false });
+        if (existingMobileUser && existingMobileUser.id !== user.id) {
+          return res.status(409).json({ success: false, message: 'Mobile already exist' });
+        }
+        await user.update({ mobile });
+      }
     }
 
     const attrs = stripUndefined(buildEmployerAttributes(body));
@@ -738,7 +795,48 @@ router.get('/:id/credit-history', async (req, res) => {
     res.json({ success: true, data: [...contactData, ...interestData] });
   } catch (err) {
     console.error('[employers/:id/credit-history] error:', err);
-    res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * GET /employers/:id/manual-credit-history
+ * List manual credits added by admins.
+ */
+router.get('/:id/manual-credit-history', authenticate, async (req, res) => {
+  try {
+    const employerId = parseInt(req.params.id, 10);
+    if (!employerId) return res.status(400).json({ success: false, message: 'Invalid employer id' });
+
+    const rows = await ManualCreditHistory.findAll({
+      where: { user_type: 'employer', user_id: employerId },
+      order: [['created_at', 'DESC']],
+      limit: 500,
+    });
+
+    const adminIds = [...new Set(rows.map((r) => r.admin_id).filter(Boolean))];
+    const admins = adminIds.length
+      ? await Admin.findAll({ where: { id: adminIds }, attributes: ['id', 'name'], paranoid: false })
+      : [];
+    const adminMap = new Map(admins.map((a) => [a.id, a.name]));
+
+    const data = rows.map((r) => ({
+      id: r.id,
+      user_type: r.user_type,
+      user_id: r.user_id,
+      contact_credit: r.contact_credit,
+      interest_credit: r.interest_credit,
+      ad_credit: r.ad_credit,
+      expiry_date: r.expiry_date,
+      admin_id: r.admin_id,
+      admin_name: r.admin_id ? (adminMap.get(r.admin_id) || null) : null,
+      created_at: r.created_at,
+    }));
+
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error('[employers/:id/manual-credit-history] error:', err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 router.get('/:id/subscription-history', (req, res) => res.json({ success: true, data: [] }));
@@ -1071,7 +1169,7 @@ const handleEmployerStatusMutation = async (req, res, field, value, message) => 
       category: 'employer',
       type: 'update',
       redirect_to: employerRedirect(employer.id),
-      log_text: `Employer ${statusLabel} updated: #${employer.id} -> ${value}`,
+      log_text: `Employer ${statusLabel} updated: #${employer.id} ${employer.name || '-'} -> ${value}`,
     });
 
     res.json({ success: true, message });
@@ -1223,13 +1321,13 @@ router.post('/:id/change-subscription', authenticate, async (req, res) => {
       category: 'employer subscription',
       type: 'update',
       redirect_to: employerRedirect(employer.id),
-      log_text: `Employer subscription changed: #${employer.id} plan_id=${plan.id}`,
+      log_text: `Employer subscription changed: #${employer.id} ${employer.name || '-'} plan=${plan.plan_name_english || plan.plan_name_hindi || plan.id}`,
     });
     await safeLog(req, {
       category: 'employer',
       type: 'update',
       redirect_to: employerRedirect(employer.id),
-      log_text: `Employer subscription changed: #${employer.id} plan_id=${plan.id}`,
+      log_text: `Employer subscription changed: #${employer.id} ${employer.name || '-'} plan=${plan.plan_name_english || plan.plan_name_hindi || plan.id}`,
     });
     res.json({
       success: true,
@@ -1276,17 +1374,27 @@ router.post('/:id/add-credits', authenticate, async (req, res) => {
 
     await employer.update(updatePayload);
 
+    await safeCreateManualCreditHistory({
+      user_type: 'employer',
+      user_id: employer.id,
+      contact_credit: Math.max(contactDelta, 0),
+      interest_credit: Math.max(interestDelta, 0),
+      ad_credit: Math.max(adDelta, 0),
+      expiry_date: req.body?.credit_expiry_at || null,
+      admin_id: getAdminId(req) || null,
+    });
+
     await safeLog(req, {
       category: 'employer subscription',
       type: 'update',
       redirect_to: employerRedirect(employer.id),
-      log_text: `Employer credits added: #${employer.id} contact=${contactDelta} interest=${interestDelta} ad=${adDelta}`,
+      log_text: `Employer credits added: #${employer.id} ${employer.name || '-'} contact=${contactDelta} interest=${interestDelta} ad=${adDelta}`,
     });
     await safeLog(req, {
       category: 'employer',
       type: 'update',
       redirect_to: employerRedirect(employer.id),
-      log_text: `Employer credits added: #${employer.id} contact=${contactDelta} interest=${interestDelta} ad=${adDelta}`,
+      log_text: `Employer credits added: #${employer.id} ${employer.name || '-'} contact=${contactDelta} interest=${interestDelta} ad=${adDelta}`,
     });
 
     res.json({
