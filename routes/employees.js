@@ -140,7 +140,37 @@ const pickEmployeePayload = (body = {}) => ({
 
 const employeeRedirect = (id) => `/employees/${id}`;
 
-const baseInclude = [
+
+const buildUserInclude = () => ({
+  model: User,
+  as: 'User',
+  attributes: [
+    'id',
+    'name',
+    'mobile',
+    'is_active',
+    'deactivation_reason',
+    'status_change_by', // NEW
+    'last_active_at',
+    'profile_completed_at',
+    'created_at'
+  ],
+  include: [
+    {
+      model: Admin,
+      as: 'StatusChangedBy', // must match User.belongsTo(... as)
+      attributes: ['id', 'name'],
+      required: false
+    }
+  ],
+  paranoid: false,
+  required: false
+});
+
+// IMPORTANT: build fresh include objects per request.
+// We mutate include (e.g., userInclude.where/required) based on filters;
+// reusing a shared object would leak filters across requests.
+const buildBaseInclude = () => ([
   { model: State, as: 'State' },
   { model: City, as: 'City' },
   { model: State, as: 'PreferredState' },
@@ -148,59 +178,13 @@ const baseInclude = [
   { model: Qualification, as: 'Qualification' },
   { model: Shift, as: 'Shift' },
   { model: EmployeeSubscriptionPlan, as: 'SubscriptionPlan' },
-  {
-    model: User,
-    as: 'User',
-    attributes: [
-      'id',
-      'name',
-      'mobile',
-      'is_active',
-      'deactivation_reason',
-      'status_change_by', // NEW
-      'last_active_at',
-      'profile_completed_at',
-      'created_at'
-    ],
-    include: [
-      {
-        model: Admin,
-        as: 'StatusChangedBy', // must match User.belongsTo(... as)
-        attributes: ['id', 'name'],
-        required: false
-      }
-    ],
-    paranoid: false
-  }
-];
+  buildUserInclude()
+]);
 
 const ensureUserInclude = (includeList = []) => {
   let userInclude = includeList.find(item => item.as === 'User');
   if (!userInclude) {
-    userInclude = {
-      model: User,
-      as: 'User',
-      attributes: [
-        'id',
-        'name',
-        'mobile',
-        'is_active',
-        'deactivation_reason',
-        'status_change_by', // NEW
-        'last_active_at',
-        'profile_completed_at',
-        'created_at'
-      ],
-      include: [
-        {
-          model: Admin,
-          as: 'StatusChangedBy',
-          attributes: ['id', 'name'],
-          required: false
-        }
-      ],
-      paranoid: false
-    };
+    userInclude = buildUserInclude();
     includeList.push(userInclude);
   }
   return userInclude;
@@ -300,7 +284,7 @@ router.get('/', async (req, res) => {
       where[Op.or] = or;
     }
 
-    const include = [...baseInclude];
+    const include = buildBaseInclude();
 
     // User filters (active/inactive + new)
     const userInclude = ensureUserInclude(include);
@@ -449,7 +433,7 @@ router.get('/:id', async (req, res) => {
     const employeeId = parseInt(req.params.id, 10);
     if (!employeeId) return res.status(400).json({ success: false, message: 'Invalid employee id' });
 
-    const include = [...baseInclude];
+    const include = buildBaseInclude();
     const employee = await Employee.findByPk(employeeId, { include, paranoid: true });
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
 

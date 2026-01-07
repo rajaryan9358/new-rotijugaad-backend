@@ -186,24 +186,38 @@ router.get('/', async (req, res) => {
     if (req.query.employer_id) jobWhere.employer_id = req.query.employer_id;
 
     // CHANGED: status filtering
-    // - expired => status='expired' OR expired_at IS NOT NULL
-    // - active/inactive => expired_at IS NULL (same behavior baseline)
+    // - expired => status='expired' OR (expired_at <= now)
+    // - active/inactive => status matches AND (expired_at IS NULL OR expired_at > now)
+    // NOTE: expired_at is used for subscription expiry; it can be non-null for active jobs.
     if (statusArr.length) {
       const statusOr = [];
+      const now = new Date();
 
       if (statusArr.includes('expired')) {
         statusOr.push({
           [Op.or]: [
             { status: 'expired' },
-            { expired_at: { [Op.not]: null } } // IS NOT NULL (dialect-safe)
+            { status: 'active', expired_at: { [Op.lte]: now } }
           ]
         });
       }
       if (statusArr.includes('active')) {
-        statusOr.push({ status: 'active', expired_at: { [Op.is]: null } });
+        statusOr.push({
+          status: 'active',
+          [Op.or]: [
+            { expired_at: { [Op.is]: null } },
+            { expired_at: { [Op.gt]: now } }
+          ]
+        });
       }
       if (statusArr.includes('inactive')) {
-        statusOr.push({ status: 'inactive', expired_at: { [Op.is]: null } });
+        statusOr.push({
+          status: 'inactive',
+          [Op.or]: [
+            { expired_at: { [Op.is]: null } },
+            { expired_at: { [Op.gt]: now } }
+          ]
+        });
       }
 
       if (statusOr.length) {
@@ -490,7 +504,14 @@ router.get('/', async (req, res) => {
         job_city: cityMap.get(job.job_city_id) || '',
         salary_min: job.salary_min,
         salary_max: job.salary_max,
-        status: job.status,
+        status: (() => {
+          const raw = String(job.status || '').toLowerCase();
+          if (raw === 'active' && job.expired_at) {
+            const exp = new Date(job.expired_at);
+            if (!Number.isNaN(exp.getTime()) && exp.getTime() <= Date.now()) return 'expired';
+          }
+          return job.status;
+        })(),
         expired_at: job.expired_at,
         updated_at: job.updated_at,
         created_at: job.created_at,
@@ -547,8 +568,9 @@ router.post('/', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Employer not found' });
     }
 
-    const expiryAt = employer.credit_expiry_at ? new Date(employer.credit_expiry_at) : null;
-    const isExpired = expiryAt && !Number.isNaN(expiryAt.getTime()) && expiryAt.getTime() <= Date.now();
+    const expiryAtRaw = employer.credit_expiry_at ? new Date(employer.credit_expiry_at) : null;
+    const expiryAt = (expiryAtRaw && !Number.isNaN(expiryAtRaw.getTime())) ? expiryAtRaw : null;
+    const isExpired = expiryAt && expiryAt.getTime() <= Date.now();
 
     const remainingAd = Number(employer.ad_credit || 0);
 
@@ -571,7 +593,7 @@ router.post('/', async (req, res) => {
     const job = await Job.create({
       ...buildJobAttributes(req.body),
       status: 'inactive',
-      expired_at: null
+      expired_at: expiryAt
     }, { transaction: t });
 
     // 2. Save JobSkills
@@ -736,6 +758,14 @@ router.get('/:id', async (req, res) => {
       success: true,
       data: {
         ...job.toJSON(),
+        status: (() => {
+          const raw = String(job.status || '').toLowerCase();
+          if (raw === 'active' && job.expired_at) {
+            const exp = new Date(job.expired_at);
+            if (!Number.isNaN(exp.getTime()) && exp.getTime() <= Date.now()) return 'expired';
+          }
+          return job.status;
+        })(),
         skills_ids,
         experiences_ids,
         genders,
@@ -874,17 +904,41 @@ router.patch('/:id/status', async (req, res) => {
 
     const requested = String(req.body?.status || '').toLowerCase();
     const nextStatus = ['active', 'inactive', 'expired'].includes(requested) ? requested : 'active';
-
     if (nextStatus === 'expired') {
       job.status = 'expired';
       job.expired_at = new Date();
-    } else if (nextStatus === 'active') {
-      job.status = 'active';
-      job.expired_at = null; // clear expiry when activating
     } else {
-      // CHANGED: inactive should behave like active (non-expired bucket)
-      job.status = 'inactive';
-      job.expired_at = null;
+      job.status = nextStatus === 'inactive' ? 'inactive' : 'active';
+
+      // IMPORTANT:
+      // - Only setting status=expired should stamp expired_at=now.
+      // - For active/inactive transitions, do not change expired_at
+      //   EXCEPT: when activating a job whose expired_at is in the past, refresh it:
+      //     - If employer credit_expiry_at is still in the future, use that
+      //     - Otherwise set expired_at to 7 days from now
+      if (job.status === 'active' && job.expired_at) {
+        const current = new Date(job.expired_at);
+        const currentMs = Number.isNaN(current.getTime()) ? null : current.getTime();
+        const nowMs = Date.now();
+
+        if (currentMs !== null && currentMs <= nowMs) {
+          let employerExpiryAt = null;
+          try {
+            const employer = await Employer.findByPk(job.employer_id, { paranoid: false });
+            const d = employer?.credit_expiry_at ? new Date(employer.credit_expiry_at) : null;
+            if (d && !Number.isNaN(d.getTime())) employerExpiryAt = d;
+          } catch (_) {
+            employerExpiryAt = null;
+          }
+
+          const employerMs = employerExpiryAt ? employerExpiryAt.getTime() : null;
+          if (employerMs !== null && employerMs > nowMs) {
+            job.expired_at = employerExpiryAt;
+          } else {
+            job.expired_at = new Date(nowMs + 7 * 24 * 60 * 60 * 1000);
+          }
+        }
+      }
     }
 
     await job.save();
