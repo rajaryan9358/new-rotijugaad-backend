@@ -23,50 +23,41 @@ app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
-// ─── Rate limiting ────────────────────────────────────────────────────────────
+// ─── Rate limiting (mobile app / user-side only) ──────────────────────────────
 //
-// Three tiers:
-//   1. otpLimiter  — strictest, 5 req / 15 min per IP → OTP send & verify endpoints
-//   2. loginLimiter — tight, 10 req / 15 min per IP  → admin login
-//   3. apiLimiter  — broad, 300 req / 15 min per IP  → all other /api/* routes
+// Admin web routes carry no rate limit — they are accessed only by authenticated
+// internal users behind the admin panel.
 //
-// Specific limiters are registered before the global one; each limiter has its
-// own independent counter so they do not share state.
+// Two tiers for mobile/user-side:
+//   1. otpLimiter     — 10 req / 5 min per IP  → OTP send & verify endpoints
+//   2. mobileApiLimiter — 500 req / 5 min per IP → all other /api/app/* routes
+//
+// OTP limiter is registered first; its stricter counter takes effect before the
+// broader mobile limiter, which runs independently on the same requests.
 
 const otpLimiter = rateLimit({
-	windowMs: 15 * 60 * 1000,
-	max: 5,
-	standardHeaders: true,
-	legacyHeaders: false,
-	message: { success: false, message: 'Too many OTP requests. Please try again in 15 minutes.' },
-});
-
-const loginLimiter = rateLimit({
-	windowMs: 15 * 60 * 1000,
+	windowMs: 5 * 60 * 1000,
 	max: 10,
 	standardHeaders: true,
 	legacyHeaders: false,
-	message: { success: false, message: 'Too many login attempts. Please try again in 15 minutes.' },
+	message: { success: false, message: 'Too many OTP requests. Please try again in 5 minutes.' },
 });
 
-const apiLimiter = rateLimit({
-	windowMs: 15 * 60 * 1000,
-	max: 300,
+const mobileApiLimiter = rateLimit({
+	windowMs: 5 * 60 * 1000,
+	max: 500,
 	standardHeaders: true,
 	legacyHeaders: false,
-	message: { success: false, message: 'Too many requests. Please try again in 15 minutes.' },
+	message: { success: false, message: 'Too many requests. Please try again in 5 minutes.' },
 });
 
-// OTP endpoints (mobile app + legacy compat routes)
+// OTP endpoints (mobile app auth + legacy compat routes)
 app.use('/api/app/auth', otpLimiter);
 app.use('/api/login', otpLimiter);
 app.use('/api/signup', otpLimiter);
 
-// Admin login
-app.use('/api/auth/login', loginLimiter);
-
-// Global API limiter covering all remaining /api/* routes
-app.use('/api', apiLimiter);
+// Broader limiter for all remaining mobile app routes
+app.use('/api/app', mobileApiLimiter);
 
 // ─── Global admin authentication guard ───────────────────────────────────────
 //
