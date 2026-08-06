@@ -1,0 +1,227 @@
+const express = require('express');
+const { Op } = require('sequelize');
+const router = express.Router();
+const models = require('../models');
+const Job = require('../models/Job');
+const JobInterest = require('../models/JobInterest');
+
+const { User, Employee, Employer } = models;
+const DeletedUser = models.DeletedUser || require('../models/DeletedUser');
+const PaymentHistory = models.PaymentHistory || require('../models/PaymentHistory');
+const Referral = models.Referral || require('../models/Referral');
+const Report = models.Report || require('../models/Report');
+const EmployeeContact = models.EmployeeContact || require('../models/EmployeeContact');
+const EmployerContact = models.EmployerContact || require('../models/EmployerContact');
+
+router.get('/', async (_req, res) => {
+  try {
+    const recentThreshold = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    const recentFromDate = recentThreshold.toISOString().slice(0, 10);
+    const recentToDate = new Date().toISOString().slice(0, 10);
+
+    const [
+      totalUsers,
+      totalEmployees,
+      totalEmployers,
+      verifiedEmployees,
+      verifiedEmployers,
+      activeEmployees,
+      activeEmployers,
+      kycVerifiedEmployees,
+      kycVerifiedEmployers,
+      pendingEmployees,
+      pendingEmployers,
+      pendingEmployeeKyc,
+      pendingEmployerKyc,
+      employeeDeleted,
+      employerDeleted,
+      employeeDeletionRequest,
+      employerDeletionRequest,
+      totalJobs,
+      activeJobs,
+      totalHired,
+      totalShortlisted,
+      totalSubscriptions,
+      activeSubscriptions,
+      totalReferrals,
+      employeeReferrals,
+      employerReferrals,
+      totalAdsReported,
+      totalProfileReported,
+      newUsers,
+      newEmployees,
+      newEmployers,
+      newJobs,
+
+      // NEW: payment history created in last 48h
+      newPaymentHistory,
+
+      // NEW: job interests created in last 48h
+      newJobInterests,
+
+      // contacts unlocked in last 48h
+      newEmployeeContactsUnlocked,
+      newEmployerContactsUnlocked,
+
+      // NEW: KYC verified employees in last 48h (based on kyc_verification_at) - powers Dashboard "Recent additions" card
+      newKycVerifiedEmployees,
+
+      // NEW: KYC verified employers in last 48h
+      newKycVerifiedEmployers,
+
+      // pending KYC updated in last 48h
+      newPendingEmployeeKyc,
+      newPendingEmployerKyc
+    ] = await Promise.all([
+      User.count(),
+      Employee.count(),
+      Employer.count(),
+      Employee.count({ where: { verification_status: 'verified' } }),
+      Employer.count({ where: { verification_status: 'verified' } }),
+      User.count({ where: { user_type: 'employee', is_active: true, profile_completed_at: { [Op.ne]: null } } }),
+      User.count({ where: { user_type: 'employer', is_active: true, profile_completed_at: { [Op.ne]: null } } }),
+      Employee.count({ where: { kyc_status: 'verified' } }),
+      Employer.count({ where: { kyc_status: 'verified' } }),
+      Employee.count({ where: { verification_status: 'pending' } }),
+      Employer.count({ where: { verification_status: 'pending' } }),
+      Employee.count({ where: { kyc_status: 'pending' } }),
+      Employer.count({ where: { kyc_status: 'pending' } }),
+      DeletedUser.count({ where: { user_type: 'employee' } }),
+      DeletedUser.count({ where: { user_type: 'employer' } }),
+      User.count({ where: { user_type: 'employee', delete_pending: true } }),
+      User.count({ where: { user_type: 'employer', delete_pending: true } }),
+      Job.count(),
+      Job.count({ where: { status: 'active' } }),
+      JobInterest.count({ where: { status: 'hired' } }),
+      JobInterest.count({ where: { status: 'shortlisted' } }),
+      PaymentHistory.count({ where: { status: 'success' } }),
+      PaymentHistory.count({
+        where: {
+          status: 'success',
+          expiry_at: { [Op.gt]: new Date() }
+        }
+      }),
+      Referral.count(),
+      Referral.count({ where: { user_type: 'employee' } }),
+      Referral.count({ where: { user_type: 'employer' } }),
+      Report.count({ where: { report_type: 'job' } }),
+      Report.count({ where: { report_type: 'employee' } }),
+      User.count({ where: { created_at: { [Op.gte]: recentThreshold } } }),
+      User.count({ where: { user_type: 'employee', created_at: { [Op.gte]: recentThreshold } } }),
+      User.count({ where: { user_type: 'employer', created_at: { [Op.gte]: recentThreshold } } }),
+      Job.count({ where: { created_at: { [Op.gte]: recentThreshold } } }),
+
+      // NEW: payment history created in last 48h
+      PaymentHistory.count({ where: { created_at: { [Op.gte]: recentThreshold } } }),
+
+      // NEW
+      JobInterest.count({ where: { created_at: { [Op.gte]: recentThreshold } } }),
+
+      // contacts unlocked in last 48h
+      EmployeeContact?.count
+        ? EmployeeContact.count({ where: { created_at: { [Op.gte]: recentThreshold } } })
+        : 0,
+      EmployerContact?.count
+        ? EmployerContact.count({ where: { created_at: { [Op.gte]: recentThreshold } } })
+        : 0,
+
+      // NEW: KYC verified employees in last 48h
+      Employee.count({
+        where: {
+          kyc_status: 'verified',
+          kyc_verification_at: { [Op.gte]: recentThreshold }
+        }
+      }),
+
+      // NEW: KYC verified employers in last 48h
+      Employer.count({
+        where: {
+          kyc_status: 'verified',
+          kyc_verification_at: { [Op.gte]: recentThreshold }
+        }
+      }),
+
+      // pending KYC updated in last 48h
+      Employee.count({
+        where: {
+          kyc_status: 'pending',
+          updated_at: { [Op.gte]: recentThreshold }
+        }
+      }),
+      Employer.count({
+        where: {
+          kyc_status: 'pending',
+          updated_at: { [Op.gte]: recentThreshold }
+        }
+      })
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        totalUsers,
+        totalEmployees,
+        totalEmployers,
+        verifiedEmployees,
+        verifiedEmployers,
+        activeEmployees,
+        activeEmployers,
+        kycVerifiedEmployees,
+        kycVerifiedEmployers,
+        pendingEmployees,
+        pendingEmployers,
+        pendingEmployeeKyc,
+        pendingEmployerKyc,
+        employeeDeleted,
+        employerDeleted,
+        employeeDeletionRequest,
+        employerDeletionRequest,
+        totalJobs,
+        activeJobs,
+        totalHired,
+        totalShortlisted,
+        totalSubscriptions,
+        activeSubscriptions,
+        totalReferrals,
+        employeeReferrals,
+        employerReferrals,
+        totalAdsReported,
+        totalProfileReported,
+        newUsers,
+        newEmployees,
+        newEmployers,
+        newJobs,
+
+        // NEW
+        newPaymentHistory,
+        newJobInterests, // (was computed but not returned)
+
+        // contacts unlocked
+        newEmployeeContactsUnlocked,
+        newEmployerContactsUnlocked,
+
+        // NEW: recent KYC verified employees
+        newKycVerifiedEmployees,
+        newKycVerifiedEmployers,
+
+        // pending KYC in last 48h
+        newPendingEmployeeKyc,
+        newPendingEmployerKyc,
+
+        recentWindow: { from: recentFromDate, to: recentToDate }
+      }
+    });
+  } catch (error) {
+    console.error('[dashboard] error', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to load dashboard metrics'
+    });
+  }
+});
+
+// NOTE: Employer verification_at is separate from kyc_verification_at; dashboard recent KYC uses the latter.
+// NEW: KYC verified employees in last 48h (based on kyc_verification_at) - powers Dashboard "Recent additions" card
+// NEW: KYC verified employers in last 48h
+
+module.exports = router;
