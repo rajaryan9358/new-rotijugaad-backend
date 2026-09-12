@@ -38,7 +38,7 @@ const EmployeeCallExperience = require('../models/EmployeeCallExperience'); // a
 const EmployerCallExperience = require('../models/EmployerCallExperience'); // new for mixed history lookups
 const { deleteByEmployeeId } = require('../utils/deleteUserTransactional');
 const Sequelize = require('sequelize');
-const { Op, fn, col } = Sequelize;
+const { Op, fn, col, literal } = Sequelize;
 const Referral = require('../models/Referral'); // added
 const { sequelize } = require('../config/db'); // added
 const Volunteer = require('../models/Volunteer'); // NEW: for assistant_code -> volunteer mapping
@@ -88,6 +88,8 @@ const normalizeDecimalOrNull = (value) => {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 };
+
+const parseBoolFlag = (value) => ['true', '1', 'yes'].includes(String(value ?? '').toLowerCase());
 
 const safeCreateLog = async (payload) => {
   try {
@@ -296,6 +298,10 @@ router.get('/', async (req, res) => {
     const kycVerifiedFrom = normalizeDateOrNull(req.query.kyc_verified_from);
     const kycVerifiedTo = normalizeDateOrNull(req.query.kyc_verified_to);
 
+    const lastSeenFrom = normalizeDateOrNull(req.query.lastSeenFrom);
+    const lastSeenTo = normalizeDateOrNull(req.query.lastSeenTo);
+    const includeNullLastSeen = parseBoolFlag(req.query.includeNullLastSeen);
+
     if (stateFilter) where.state_id = stateFilter;
     if (cityFilter) where.city_id = cityFilter;
     if (prefStateFilter) where.preferred_state_id = prefStateFilter;
@@ -351,6 +357,19 @@ router.get('/', async (req, res) => {
     if (statusFilter === 'inactive') userWhere.is_active = false;
     if (newFilter === 'new') {
       userWhere.created_at = { [Op.gte]: new Date(Date.now() - 48 * 60 * 60 * 1000) };
+    }
+    if (lastSeenFrom || lastSeenTo || includeNullLastSeen) {
+      const lastSeenConditions = [];
+      if (lastSeenFrom || lastSeenTo) {
+        const range = {};
+        if (lastSeenFrom) range[Op.gte] = startOfDay(lastSeenFrom);
+        if (lastSeenTo) range[Op.lt] = endExclusiveOfDay(lastSeenTo);
+        lastSeenConditions.push({ last_active_at: range });
+      }
+      if (includeNullLastSeen) lastSeenConditions.push({ last_active_at: null });
+      userWhere[Op.and] = (userWhere[Op.and] || []).concat(
+        lastSeenConditions.length > 1 ? [{ [Op.or]: lastSeenConditions }] : lastSeenConditions
+      );
     }
     if (Object.keys(userWhere).length) {
       userInclude.where = userWhere;
@@ -969,6 +988,144 @@ router.post('/:id/change-subscription', authenticate, async (req, res) => {
     });
   } catch (error) {
     console.error('[employees:change-subscription] error', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * POST /employees/bulk/add-credits
+ * Bulk grant/set credits + expiry to employees matching a last-seen filter.
+ * Registered before the generic '/:id/add-credits' route below since that
+ * pattern would otherwise also match this literal path (id='bulk').
+ * Body: { mode: 'set'|'increment', contact_credits, interest_credits, credit_expiry_at, reason,
+ *         lastSeenFrom, lastSeenTo, includeNullLastSeen }
+ */
+router.post('/bulk/add-credits', authenticate, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const mode = body.mode === 'increment' ? 'increment' : (body.mode === 'set' ? 'set' : null);
+    if (!mode) return res.status(400).json({ success: false, message: 'mode must be "set" or "increment"' });
+
+    const reason = (body.reason || '').toString().trim();
+    if (!reason) return res.status(400).json({ success: false, message: 'Reason is required' });
+
+    const contactVal = normalizeIntOrNull(body.contact_credits);
+    const interestVal = normalizeDecimalOrNull(body.interest_credits);
+    const expiryVal = normalizeDateOrNull(body.credit_expiry_at);
+
+    if (contactVal === null && interestVal === null && !expiryVal) {
+      return res.status(400).json({ success: false, message: 'Provide at least one credit field or an expiry date' });
+    }
+
+    const lastSeenFrom = normalizeDateOrNull(body.lastSeenFrom);
+    const lastSeenTo = normalizeDateOrNull(body.lastSeenTo);
+    const includeNullLastSeen = parseBoolFlag(body.includeNullLastSeen);
+
+    const userWhere = {};
+    if (lastSeenFrom || lastSeenTo || includeNullLastSeen) {
+      const lastSeenConditions = [];
+      if (lastSeenFrom || lastSeenTo) {
+        const range = {};
+        if (lastSeenFrom) range[Op.gte] = startOfDay(lastSeenFrom);
+        if (lastSeenTo) range[Op.lt] = endExclusiveOfDay(lastSeenTo);
+        lastSeenConditions.push({ last_active_at: range });
+      }
+      if (includeNullLastSeen) lastSeenConditions.push({ last_active_at: null });
+      userWhere[Op.and] = lastSeenConditions.length > 1 ? [{ [Op.or]: lastSeenConditions }] : lastSeenConditions;
+    }
+    const hasLastSeenFilter = Object.keys(userWhere).length > 0;
+
+    const matches = await Employee.findAll({
+      attributes: ['id'],
+      include: [{
+        model: User,
+        as: 'User',
+        attributes: ['id', 'preferred_language', 'fcm_token', 'is_active', 'delete_pending'],
+        required: hasLastSeenFilter,
+        where: hasLastSeenFilter ? userWhere : undefined,
+      }],
+    });
+
+    const matchedIds = matches.map((m) => m.id);
+    if (!matchedIds.length) {
+      return res.json({ success: true, message: 'No matching employees found', data: { matchedCount: 0, updatedCount: 0 } });
+    }
+
+    const updatePayload = {};
+    if (contactVal !== null) {
+      updatePayload.contact_credit = mode === 'set' ? contactVal : literal(`contact_credit + ${contactVal}`);
+      updatePayload.total_contact_credit = mode === 'set' ? contactVal : literal(`total_contact_credit + ${contactVal}`);
+    }
+    if (interestVal !== null) {
+      updatePayload.interest_credit = mode === 'set' ? interestVal : literal(`interest_credit + ${interestVal}`);
+      updatePayload.total_interest_credit = mode === 'set' ? interestVal : literal(`total_interest_credit + ${interestVal}`);
+    }
+    if (expiryVal) updatePayload.credit_expiry_at = expiryVal;
+
+    await Employee.update(updatePayload, { where: { id: { [Op.in]: matchedIds } } });
+
+    try {
+      await ManualCreditHistory.bulkCreate(matchedIds.map((id) => ({
+        user_type: 'employee',
+        user_id: id,
+        contact_credit: contactVal || 0,
+        interest_credit: interestVal || 0,
+        ad_credit: 0,
+        expiry_date: expiryVal || null,
+        reason,
+        admin_id: getAdminId(req) || null,
+      })));
+    } catch (e) {
+      // never break main flow for history writes
+    }
+
+    await safeLog(req, {
+      category: 'employee subscription',
+      type: 'update',
+      redirect_to: '/employees',
+      log_text: `Bulk credits ${mode} for ${matchedIds.length} employees: contact=${contactVal ?? '-'} interest=${interestVal ?? '-'} expiry=${expiryVal ? expiryVal.toISOString() : '-'} reason=${reason}`,
+    });
+
+    const creditMessage = buildEmployeeCreditMessage({
+      contactDelta: contactVal || 0,
+      interestDelta: interestVal || 0,
+    });
+    const tpl = getNotificationTemplate('employee.credit.added', { credits: creditMessage.bodyEnglish });
+
+    const NOTIFY_BATCH_SIZE = 50;
+    for (let i = 0; i < matches.length; i += NOTIFY_BATCH_SIZE) {
+      const batch = matches.slice(i, i + NOTIFY_BATCH_SIZE);
+      await Promise.all(batch.map(async (employee) => {
+        const linkedUser = employee.User;
+        if (!linkedUser) return;
+        try {
+          await notifyUser({
+            user: linkedUser,
+            titleEnglish: tpl?.title_en || 'Credits Added',
+            titleHindi: tpl?.title_hi || 'Credits Add Ho Gaye!',
+            bodyEnglish: creditMessage.bodyEnglish,
+            bodyHindi: creditMessage.bodyHindi,
+            referenceType: 'employee_credit',
+            referenceId: employee.id,
+            extraData: {
+              event: 'employee.credit.added',
+              entity: 'employee',
+              entity_id: String(employee.id),
+            },
+          });
+        } catch (e) {
+          console.error('[employees:bulk-add-credits] notify failed', employee.id, e.message);
+        }
+      }));
+    }
+
+    return res.json({
+      success: true,
+      message: 'Credits updated',
+      data: { matchedCount: matchedIds.length, updatedCount: matchedIds.length },
+    });
+  } catch (error) {
+    console.error('[employees:bulk-add-credits] error', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 });
