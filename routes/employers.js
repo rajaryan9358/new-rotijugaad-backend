@@ -1748,7 +1748,9 @@ router.post('/bulk/add-credits', authenticate, async (req, res) => {
       if (includeNullLastSeen) lastSeenConditions.push({ last_active_at: null });
       userWhere[Op.and] = lastSeenConditions.length > 1 ? [{ [Op.or]: lastSeenConditions }] : lastSeenConditions;
     }
-    const hasLastSeenFilter = Object.keys(userWhere).length > 0;
+    // NOTE: userWhere's only possible key here is the Symbol Op.and, which
+    // Object.keys() can't see — check the source condition directly instead.
+    const hasLastSeenFilter = Boolean(lastSeenFrom || lastSeenTo || includeNullLastSeen);
 
     const matches = await Employer.findAll({
       attributes: ['id'],
