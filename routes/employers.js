@@ -203,17 +203,17 @@ const normalizeDateOrNull = (value) => {
   return Number.isNaN(d.getTime()) ? null : d;
 };
 
-const startOfDay = (date) => {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
-};
+// Date-only query params (e.g. "2026-08-31" from an <input type="date">) always
+// parse as UTC midnight per the ECMA-262 spec, regardless of server locale.
+// The admin UI displays timestamps in IST (browser-local), so day boundaries for
+// range filters must be computed against IST too — using the server process's own
+// local time (via setHours/setDate) is wrong whenever the server isn't running in
+// IST, since it silently shifts the cutoff by the server/IST offset.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
-const endExclusiveOfDay = (date) => {
-  const d = startOfDay(date);
-  d.setDate(d.getDate() + 1);
-  return d;
-};
+const startOfDay = (date) => new Date(new Date(date).getTime() - IST_OFFSET_MS);
+
+const endExclusiveOfDay = (date) => new Date(startOfDay(date).getTime() + 24 * 60 * 60 * 1000);
 
 
 /**

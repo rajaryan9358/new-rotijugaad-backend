@@ -62,18 +62,20 @@ const normalizeDateOrNull = (value) => {
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
 };
-// NEW: treat date-only bounds as start-of-day and end-exclusive (next day start)
+// Date-only query params (e.g. "2026-08-31" from an <input type="date">) always
+// parse as UTC midnight per the ECMA-262 spec, regardless of server locale.
+// The admin UI displays timestamps in IST (browser-local), so day boundaries for
+// range filters must be computed against IST too — using the server process's own
+// local time (via setHours/setDate) is wrong whenever the server isn't running in
+// IST, since it silently shifts the cutoff by the server/IST offset.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const startOfDay = (d) => {
   if (!d) return null;
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
+  return new Date(d.getTime() - IST_OFFSET_MS);
 };
 const endExclusiveOfDay = (d) => {
   if (!d) return null;
-  const x = startOfDay(d);
-  x.setDate(x.getDate() + 1);
-  return x;
+  return new Date(startOfDay(d).getTime() + 24 * 60 * 60 * 1000);
 };
 // Add: normalize integer helper
 const normalizeIntOrNull = (value) => {
